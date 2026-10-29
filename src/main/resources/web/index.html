@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>GhostPOS Management</title>
+    <link rel="stylesheet" href="/style.css">
+    <link rel="stylesheet" href="/management.css">
+    <script src="/app.js" defer></script>
+</head>
+<body class="management-body">
+<main id="login-screen" class="login-screen">
+    <form id="login-form" class="login-card">
+        <div class="brand-mark" aria-hidden="true">G</div>
+        <p class="eyebrow">GHOSTPOS CONTROL CENTER</p>
+        <h1>Management sign in</h1>
+        <p class="muted">Use your GhostPOS staff account to continue.</p>
+        <label for="login-username">Username</label>
+        <input id="login-username" name="username" autocomplete="username" required>
+        <label for="login-password">Password</label>
+        <input id="login-password" name="password" type="password" autocomplete="current-password" required>
+        <button class="btn btn-primary full-width" type="submit">Sign in</button>
+        <p id="login-error" class="form-error" role="alert"></p>
+    </form>
+</main>
+
+<div id="application" class="application-shell" hidden>
+    <aside class="sidebar">
+        <a class="sidebar-brand" href="/" aria-label="GhostPOS home">
+            <span class="brand-mark small" aria-hidden="true">G</span>
+            <span><strong>GhostPOS</strong><small>MANAGEMENT</small></span>
+        </a>
+        <nav class="side-navigation" aria-label="Management sections">
+            <button class="nav-item active" type="button" data-view="overview"><span>01</span> Overview</button>
+            <button class="nav-item" type="button" data-view="inventory" data-permission="VIEW_PRODUCTS"><span>02</span> Inventory</button>
+            <button class="nav-item" type="button" data-view="transactions" data-permission="VIEW_INVENTORY"><span>03</span> Stock activity</button>
+            <button class="nav-item" type="button" data-view="receipts" data-permission="PROCESS_SALES"><span>04</span> Sales &amp; receipts</button>
+            <button class="nav-item" type="button" data-view="users" data-permission="VIEW_USERS"><span>05</span> Users</button>
+            <button class="nav-item" type="button" data-view="settings" data-permission="MANAGE_SYSTEM_SETTINGS"><span>06</span> Settings</button>
+        </nav>
+        <div class="sidebar-footer">
+            <span class="connection-dot"></span>
+            <span>Backend connected</span>
+        </div>
+    </aside>
+
+    <section class="workspace">
+        <header class="topbar">
+            <div class="mobile-brand"><span class="brand-mark tiny" aria-hidden="true">G</span> GhostPOS</div>
+            <div class="topbar-context"><span class="eyebrow">STORE OPERATIONS</span><strong id="store-name">Management</strong></div>
+            <div class="account-menu">
+                <span id="account-avatar" class="account-avatar">U</span>
+                <span class="account-copy"><strong id="account-name">User</strong><small id="account-role">ROLE</small></span>
+                <button id="logout-button" class="btn btn-secondary compact" type="button">Sign out</button>
+            </div>
+        </header>
+        <main id="view-root" class="content-area" tabindex="-1"></main>
+    </section>
+</div>
+
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+<dialog id="modal" class="management-modal" aria-labelledby="modal-title">
+    <div id="modal-content"></div>
+</dialog>
+</body>
+</html>
