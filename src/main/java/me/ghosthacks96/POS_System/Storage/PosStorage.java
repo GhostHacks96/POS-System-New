@@ -13,21 +13,30 @@ import static me.ghosthacks96.POS_System.Storage.PosData.PurchaseOrderReceipt;
 import static me.ghosthacks96.POS_System.Storage.PosData.Product;
 import static me.ghosthacks96.POS_System.Storage.PosData.Register;
 import static me.ghosthacks96.POS_System.Storage.PosData.SaleDraft;
+import static me.ghosthacks96.POS_System.Storage.PosData.SaleDetails;
 import static me.ghosthacks96.POS_System.Storage.PosData.SaleReceipt;
+import static me.ghosthacks96.POS_System.Storage.PosData.SaleSummary;
 import static me.ghosthacks96.POS_System.Storage.PosData.Shift;
 import static me.ghosthacks96.POS_System.Storage.PosData.Supplier;
 import static me.ghosthacks96.POS_System.Storage.PosData.SystemUser;
+import static me.ghosthacks96.POS_System.Storage.PosData.UserAccount;
 
 public interface PosStorage extends AutoCloseable {
     void initialize() throws SQLException;
 
     Product saveProduct(Product product) throws SQLException;
 
+    Product updateProductDetails(Product product) throws SQLException;
+
     Optional<Product> getProduct(long id) throws SQLException;
 
     Optional<Product> getProductBySku(String sku) throws SQLException;
 
+    Optional<Product> getProductByBarcode(String barcode) throws SQLException;
+
     List<Product> listProducts(boolean activeOnly) throws SQLException;
+
+    List<Product> listLowStockProducts() throws SQLException;
 
     InventoryTransaction adjustInventory(
             long productId,
@@ -40,9 +49,37 @@ public interface PosStorage extends AutoCloseable {
 
     List<InventoryTransaction> getInventoryTransactions(long productId, int limit) throws SQLException;
 
+    List<InventoryTransaction> getRecentInventoryTransactions(int limit) throws SQLException;
+
+    InventoryTransaction setInventoryCount(
+            long productId,
+            Long userId,
+            int countedQuantity,
+            String note,
+            String reference
+    ) throws SQLException;
+
     SystemUser createUser(SystemUser user) throws SQLException;
 
+    SystemUser createInitialAdmin(SystemUser admin) throws SQLException;
+
     Optional<SystemUser> getUserByUsername(String username) throws SQLException;
+
+    Optional<UserAccount> getUserById(long id) throws SQLException;
+
+    List<UserAccount> listUsers() throws SQLException;
+
+    int countUsers() throws SQLException;
+
+    int countActiveAdmins() throws SQLException;
+
+    void updateUserRole(long id, String role) throws SQLException;
+
+    void setUserActive(long id, boolean active) throws SQLException;
+
+    void updateUserPassword(long id, String passwordHash) throws SQLException;
+
+    void updateUserLastLogin(long id) throws SQLException;
 
     Customer createCustomer(Customer customer) throws SQLException;
 
@@ -71,6 +108,10 @@ public interface PosStorage extends AutoCloseable {
     void recordAuditEntry(AuditEntry entry) throws SQLException;
 
     SaleReceipt completeSale(SaleDraft sale) throws SQLException;
+
+    Optional<SaleDetails> getSaleByNumber(String saleNumber) throws SQLException;
+
+    List<SaleSummary> listRecentSales(int limit, Long userId) throws SQLException;
 
     @Override
     void close() throws SQLException;

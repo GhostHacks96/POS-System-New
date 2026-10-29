@@ -11,6 +11,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.Supplier;
 
 import static me.ghosthacks96.POS_System.Storage.PosData.SystemUser;
 import static me.ghosthacks96.POS_System.Storage.PosData.UserAccount;
@@ -24,10 +25,18 @@ public final class UserService {
             BCrypt.gensalt(BCRYPT_COST)
     );
 
-    private final PosStorage storage;
+    private final Supplier<PosStorage> storageProvider;
 
     public UserService(PosStorage storage) {
-        this.storage = Objects.requireNonNull(storage, "storage");
+        this(() -> Objects.requireNonNull(storage, "storage"));
+    }
+
+    public UserService(Supplier<PosStorage> storageProvider) {
+        this.storageProvider = Objects.requireNonNull(storageProvider, "storageProvider");
+    }
+
+    private PosStorage storage() {
+        return Objects.requireNonNull(storageProvider.get(), "storageProvider returned null");
     }
 
     public UserPrincipal createInitialAdmin(String username, char[] password, String displayName)
@@ -37,7 +46,7 @@ public final class UserService {
             validatePassword(password);
             String normalizedDisplayName = normalizeDisplayName(displayName);
             String passwordHash = hashPassword(password);
-            SystemUser created = storage.createInitialAdmin(new SystemUser(
+            SystemUser created = storage().createInitialAdmin(new SystemUser(
                     0, normalizedUsername, passwordHash, normalizedDisplayName, UserRole.ADMIN.name(), true
             ));
             return toPrincipal(created);
@@ -49,7 +58,7 @@ public final class UserService {
     }
 
     public boolean isInitialAdminRequired() throws SQLException {
-        return storage.countUsers() == 0;
+        return storage().countUsers() == 0;
     }
 
     public Optional<UserPrincipal> authenticate(String username, char[] password) throws SQLException {
@@ -76,7 +85,7 @@ public final class UserService {
             return Optional.empty();
         }
 
-        Optional<SystemUser> candidate = storage.getUserByUsername(normalizedUsername);
+        Optional<SystemUser> candidate = storage().getUserByUsername(normalizedUsername);
         if (candidate.isEmpty()) {
             checkDummyPassword(password);
             return Optional.empty();
@@ -93,8 +102,8 @@ public final class UserService {
             return Optional.empty();
         }
 
-        storage.updateUserLastLogin(user.id());
-        return storage.getUserById(user.id()).map(this::toPrincipal);
+        storage().updateUserLastLogin(user.id());
+        return storage().getUserById(user.id()).map(this::toPrincipal);
     }
 
     public boolean hasPermission(UserPrincipal actor, Permission permission) throws SQLException {
@@ -103,7 +112,7 @@ public final class UserService {
     }
 
     public UserPrincipal getActiveUser(long userId) throws SQLException {
-        UserPrincipal user = storage.getUserById(userId)
+        UserPrincipal user = storage().getUserById(userId)
                 .map(this::toPrincipal)
                 .orElseThrow(() -> new SecurityException("User account no longer exists"));
         if (!user.active()) {
@@ -114,7 +123,7 @@ public final class UserService {
 
     public List<UserPrincipal> listUsers(UserPrincipal actor) throws SQLException {
         requirePermission(actor, Permission.VIEW_USERS);
-        return storage.listUsers().stream().map(this::toPrincipal).toList();
+        return storage().listUsers().stream().map(this::toPrincipal).toList();
     }
 
     public UserPrincipal createUser(
@@ -131,7 +140,7 @@ public final class UserService {
                 throw new SecurityException("Your role cannot assign the " + role + " role");
             }
             validatePassword(password);
-            SystemUser created = storage.createUser(new SystemUser(
+            SystemUser created = storage().createUser(new SystemUser(
                     0,
                     normalizeUsername(username),
                     hashPassword(password),
@@ -158,10 +167,10 @@ public final class UserService {
             throw new SecurityException("Your role cannot manage that user's role");
         }
         if (target.role() == UserRole.ADMIN && newRole != UserRole.ADMIN
-                && storage.countActiveAdmins() <= 1 && target.active()) {
+                && storage().countActiveAdmins() <= 1 && target.active()) {
             throw new IllegalStateException("Cannot demote the last active administrator");
         }
-        storage.updateUserRole(targetUserId, newRole.name());
+        storage().updateUserRole(targetUserId, newRole.name());
         return findUser(targetUserId);
     }
 
@@ -175,10 +184,10 @@ public final class UserService {
             throw new SecurityException("Your role cannot manage that user's account");
         }
         if (!active && target.role() == UserRole.ADMIN && target.active()
-                && storage.countActiveAdmins() <= 1) {
+                && storage().countActiveAdmins() <= 1) {
             throw new IllegalStateException("Cannot deactivate the last active administrator");
         }
-        storage.setUserActive(targetUserId, active);
+        storage().setUserActive(targetUserId, active);
         return findUser(targetUserId);
     }
 
@@ -186,13 +195,13 @@ public final class UserService {
             throws SQLException {
         try {
             UserPrincipal currentActor = currentActor(actor);
-            Optional<SystemUser> user = storage.getUserByUsername(currentActor.username());
+            Optional<SystemUser> user = storage().getUserByUsername(currentActor.username());
             if (user.isEmpty() || !isValidPasswordLength(currentPassword)
                     || !BCrypt.checkpw(new String(currentPassword), user.get().passwordHash())) {
                 throw new SecurityException("Current password is incorrect");
             }
             validatePassword(newPassword);
-            storage.updateUserPassword(currentActor.id(), hashPassword(newPassword));
+            storage().updateUserPassword(currentActor.id(), hashPassword(newPassword));
         } finally {
             if (currentPassword != null) {
                 Arrays.fill(currentPassword, '\0');
@@ -211,7 +220,7 @@ public final class UserService {
                 throw new SecurityException("Your role cannot reset that user's password");
             }
             validatePassword(newPassword);
-            storage.updateUserPassword(targetUserId, hashPassword(newPassword));
+            storage().updateUserPassword(targetUserId, hashPassword(newPassword));
         } finally {
             if (newPassword != null) {
                 Arrays.fill(newPassword, '\0');
@@ -229,7 +238,7 @@ public final class UserService {
 
     private UserPrincipal currentActor(UserPrincipal actor) throws SQLException {
         Objects.requireNonNull(actor, "actor");
-        UserPrincipal currentActor = storage.getUserById(actor.id())
+        UserPrincipal currentActor = storage().getUserById(actor.id())
                 .map(this::toPrincipal)
                 .orElseThrow(() -> new SecurityException("User account no longer exists"));
         if (!currentActor.active()) {
@@ -242,7 +251,7 @@ public final class UserService {
         if (id <= 0) {
             throw new IllegalArgumentException("User ID must be positive");
         }
-        return storage.getUserById(id)
+        return storage().getUserById(id)
                 .map(this::toPrincipal)
                 .orElseThrow(() -> new IllegalArgumentException("User does not exist: " + id));
     }

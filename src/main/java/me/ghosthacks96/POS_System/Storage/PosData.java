@@ -33,6 +33,15 @@ public final class PosData {
     ) {
     }
 
+    public record UserAccount(
+            long id,
+            String username,
+            String displayName,
+            String role,
+            boolean active
+    ) {
+    }
+
     public record Customer(
             long id,
             String name,
@@ -137,5 +146,29 @@ public final class PosData {
             BigDecimal taxAmount,
             BigDecimal total
     ) {
+    }
+
+    public record SaleSummary(
+            long id,
+            String saleNumber,
+            long userId,
+            BigDecimal total,
+            String status,
+            Instant createdAt
+    ) {
+    }
+
+    public record SaleDetails(
+            SaleReceipt receipt,
+            Long customerId,
+            long userId,
+            Instant createdAt,
+            List<SaleLine> lines,
+            List<PaymentLine> payments
+    ) {
+        public SaleDetails {
+            lines = List.copyOf(lines);
+            payments = List.copyOf(payments);
+        }
     }
 }

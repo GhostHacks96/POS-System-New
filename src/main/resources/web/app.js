@@ -7,7 +7,10 @@ const state = {
     permissions: new Set(),
     storeName: "GhostPOS",
     currentView: "overview",
-    toastTimer: null
+    toastTimer: null,
+    logPollTimer: null,
+    logCursor: 0,
+    displayedLogs: []
 };
 
 const loginScreen = document.getElementById("login-screen");
@@ -63,6 +66,28 @@ async function api(path, options = {}) {
             headers,
             body: options.body === undefined ? undefined : JSON.stringify(options.body)
         });
+
+        viewRoot.addEventListener("change", async event => {
+            if (event.target.id !== "setting-debug") return;
+            const checkbox = event.target;
+            checkbox.disabled = true;
+            try {
+                const result = await api("/system/debug", {
+                    method: "PUT",
+                    body: { enabled: checkbox.checked }
+                });
+                const configView = document.getElementById("config-view");
+                const configValues = JSON.parse(configView.value);
+                configValues.debug = result.enabled;
+                configView.value = JSON.stringify(configValues, null, 2);
+                setNotice(`Debug logging ${result.enabled ? "enabled" : "disabled"}.`);
+            } catch (error) {
+                checkbox.checked = !checkbox.checked;
+                setNotice(error.message, true);
+            } finally {
+                checkbox.disabled = false;
+            }
+        });
     } catch {
         throw new Error("Cannot reach the GhostPOS API. Check the server and web.api-base-url setting.");
     }
@@ -85,6 +110,7 @@ async function api(path, options = {}) {
 }
 
 function clearSession() {
+    stopSettingsLogPolling();
     state.token = "";
     state.user = null;
     state.permissions.clear();
@@ -156,6 +182,7 @@ function button(label, action, id, style = "btn-secondary") {
 }
 
 async function renderView() {
+    stopSettingsLogPolling();
     viewRoot.innerHTML = `<div class="loading-state">Loading GhostPOS data…</div>`;
     switch (state.currentView) {
         case "inventory": return renderInventory();
@@ -293,8 +320,32 @@ async function renderUsers() {
 
 async function renderSettings() {
     const settings = await api("/settings");
+    const isAdmin = hasPermission("ADMINISTER_SYSTEM");
+    const systemConfig = isAdmin ? await api("/system/config") : null;
     state.storeName = settings.storeName;
     document.getElementById("store-name").textContent = settings.storeName;
+    const systemControls = isAdmin ? `
+        <section class="panel settings-card">
+            <div class="panel-heading"><div><h2>Backend controls</h2><p>Administrator-only process and service actions</p></div></div>
+            <p class="settings-note">Configuration reload applies runtime settings. API/web listener and session changes still require a restart. Reload storage to apply database connection changes from YAML.</p>
+            <div class="heading-actions">
+                <button class="btn btn-secondary" type="button" data-action="reload-config">Reload configuration</button>
+                <button class="btn btn-secondary" type="button" data-action="reload-storage">Reload storage</button>
+                <button class="btn btn-secondary" type="button" data-action="shutdown">Shut down backend</button>
+            </div>
+        </section>
+        <section class="panel settings-card">
+            <div class="panel-heading"><div><h2>Diagnostics</h2><p>Administrator-only runtime configuration and logs</p></div></div>
+            <p class="settings-note">Sensitive configuration values are masked. Debug logging is saved to config.yml immediately. The live log shows recent entries from this running backend.</p>
+            <label class="debug-setting" for="setting-debug">
+                <input id="setting-debug" type="checkbox" ${systemConfig.debugEnabled ? "checked" : ""}>
+                <span><strong>Enable debug logging</strong><small>Additional diagnostic messages will be recorded by the backend.</small></span>
+            </label>
+            <label class="diagnostic-label" for="config-view">Current configuration (JSON)</label>
+            <textarea id="config-view" class="diagnostic-textarea config-view" readonly spellcheck="false">${escapeHtml(JSON.stringify(systemConfig.values, null, 2))}</textarea>
+            <div class="panel-heading log-heading"><div><h3>Live log</h3><p id="log-status" aria-live="polite">Connecting to log stream…</p></div><button class="btn btn-secondary compact" type="button" data-action="refresh-logs">Refresh</button></div>
+            <textarea id="live-log" class="diagnostic-textarea live-log" readonly aria-label="Recent backend log entries" spellcheck="false"></textarea>
+        </section>` : "";
     viewRoot.innerHTML = `
         ${heading("SYSTEM", "Settings", "Update the store identity shown across the management interface.")}
         <section class="panel settings-card">
@@ -304,7 +355,44 @@ async function renderSettings() {
                 <div class="form-field"><label for="setting-store-name">Store name</label><input id="setting-store-name" name="storeName" maxlength="100" required value="${escapeHtml(settings.storeName)}"></div>
                 <button class="btn btn-primary" type="submit">Save changes</button>
             </form>
-        </section>`;
+        </section>
+        ${systemControls}`;
+    if (isAdmin) {
+        state.logCursor = 0;
+        state.displayedLogs = [];
+        await refreshLogs();
+        state.logPollTimer = window.setInterval(() => {
+            refreshLogs().catch(error => {
+                const status = document.getElementById("log-status");
+                if (status) status.textContent = `Log updates unavailable: ${error.message}`;
+            });
+        }, 2000);
+    }
+}
+
+function stopSettingsLogPolling() {
+    if (state.logPollTimer !== null) {
+        window.clearInterval(state.logPollTimer);
+        state.logPollTimer = null;
+    }
+}
+
+async function refreshLogs() {
+    const response = await api(`/system/logs?after=${state.logCursor}`);
+    const logArea = document.getElementById("live-log");
+    const status = document.getElementById("log-status");
+    if (!logArea || !status) return;
+    const shouldScroll = logArea.scrollTop + logArea.clientHeight >= logArea.scrollHeight - 24;
+    for (const entry of response.entries) {
+        state.logCursor = Math.max(state.logCursor, entry.sequence);
+        state.displayedLogs.push(entry.line);
+    }
+    if (state.displayedLogs.length > 1000) {
+        state.displayedLogs.splice(0, state.displayedLogs.length - 1000);
+    }
+    logArea.value = state.displayedLogs.join("\n");
+    if (shouldScroll) logArea.scrollTop = logArea.scrollHeight;
+    status.textContent = "Live updates every 2 seconds";
 }
 
 function showModal(title, subtitle, body) {
@@ -537,6 +625,29 @@ viewRoot.addEventListener("click", async event => {
     try {
         if (action === "navigate") return selectView(id);
         if (action === "refresh") return renderView();
+        if (action === "refresh-logs") return await refreshLogs();
+        if (action === "reload-config") {
+            if (!window.confirm("Reload configuration files from disk? Server binding changes will still require a restart.")) {
+                return;
+            }
+            const result = await api("/system/reload-config", { method: "POST" });
+            setNotice(result.message);
+            return renderSettings();
+        }
+        if (action === "reload-storage") {
+            if (!window.confirm("Reload the storage backend using the current configuration?")) return;
+            const result = await api("/system/reload-storage", { method: "POST" });
+            setNotice(result.message);
+            return renderSettings();
+        }
+        if (action === "shutdown") {
+            if (!window.confirm("Shut down the GhostPOS backend? Active register and management connections will stop.")) {
+                return;
+            }
+            const result = await api("/system/shutdown", { method: "POST" });
+            setNotice(result.message);
+            return;
+        }
         if (action === "new-product") return productForm();
         if (action === "edit-product") {
             const product = (await api("/products?activeOnly=false")).find(item => item.id === Number(id));

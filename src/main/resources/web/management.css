@@ -600,6 +600,77 @@
     line-height: 1.55;
 }
 
+.debug-setting {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    margin: 18px 0 22px;
+    cursor: pointer;
+}
+
+.debug-setting input {
+    width: 18px;
+    min-height: 18px;
+    margin-top: 2px;
+    accent-color: #00d9df;
+}
+
+.debug-setting span,
+.debug-setting small {
+    display: block;
+}
+
+.debug-setting small {
+    margin-top: 4px;
+    color: #9eafb8;
+    font-size: .8rem;
+}
+
+.diagnostic-label {
+    display: block;
+    margin: 16px 0 8px;
+    color: #c6d1d8;
+    font-size: .84rem;
+    font-weight: 650;
+}
+
+.diagnostic-textarea {
+    display: block;
+    width: 100%;
+    min-height: 220px;
+    resize: vertical;
+    overflow: auto;
+    border-color: #273842;
+    background: #070b0e;
+    color: #b9d1d8;
+    font-family: Consolas, "Courier New", monospace !important;
+    font-size: .78rem;
+    line-height: 1.5;
+    tab-size: 2;
+    white-space: pre;
+}
+
+.config-view {
+    min-height: 280px;
+}
+
+.live-log {
+    min-height: 360px;
+}
+
+.log-heading {
+    margin-top: 22px;
+}
+
+.log-heading h3 {
+    margin: 0;
+    font-size: 1rem;
+}
+
+.log-heading p {
+    margin-top: 5px;
+}
+
 .management-modal {
     width: min(620px, calc(100% - 28px));
     max-width: 620px;

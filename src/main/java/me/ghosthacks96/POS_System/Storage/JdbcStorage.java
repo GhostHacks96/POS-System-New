@@ -26,11 +26,14 @@ import static me.ghosthacks96.POS_System.Storage.PosData.PurchaseOrderReceipt;
 import static me.ghosthacks96.POS_System.Storage.PosData.Product;
 import static me.ghosthacks96.POS_System.Storage.PosData.Register;
 import static me.ghosthacks96.POS_System.Storage.PosData.SaleDraft;
+import static me.ghosthacks96.POS_System.Storage.PosData.SaleDetails;
 import static me.ghosthacks96.POS_System.Storage.PosData.SaleLine;
 import static me.ghosthacks96.POS_System.Storage.PosData.SaleReceipt;
+import static me.ghosthacks96.POS_System.Storage.PosData.SaleSummary;
 import static me.ghosthacks96.POS_System.Storage.PosData.Shift;
 import static me.ghosthacks96.POS_System.Storage.PosData.Supplier;
 import static me.ghosthacks96.POS_System.Storage.PosData.SystemUser;
+import static me.ghosthacks96.POS_System.Storage.PosData.UserAccount;
 
 public abstract class JdbcStorage implements PosStorage {
     private static final String[] TABLES = {
@@ -70,6 +73,11 @@ public abstract class JdbcStorage implements PosStorage {
                 active BOOLEAN NOT NULL DEFAULT TRUE,
                 created_at VARCHAR(32) NOT NULL,
                 last_login_at VARCHAR(32)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS system_user_bootstrap (
+                id ${LONG} PRIMARY KEY
             )
             """,
             """
@@ -245,6 +253,10 @@ public abstract class JdbcStorage implements PosStorage {
 
     protected abstract String longType();
 
+    protected abstract String bootstrapRowSql();
+
+    protected abstract void lockBootstrapRow(Connection connection) throws SQLException;
+
     @Override
     public final void initialize() throws SQLException {
         try (Connection connection = openConnection();
@@ -254,6 +266,7 @@ public abstract class JdbcStorage implements PosStorage {
                         .replace("${ID}", idDefinition())
                         .replace("${LONG}", longType()));
             }
+            statement.executeUpdate(bootstrapRowSql());
         } catch (SQLException exception) {
             logger.severe("Unable to initialize POS database schema: " + exception.getMessage());
             throw exception;
@@ -342,6 +355,43 @@ public abstract class JdbcStorage implements PosStorage {
     }
 
     @Override
+    public final Product updateProductDetails(Product product) throws SQLException {
+        Objects.requireNonNull(product, "product");
+        validateProduct(product);
+        if (product.id() <= 0) {
+            throw new IllegalArgumentException("Updated product must have a valid ID");
+        }
+
+        String sql = """
+                UPDATE products SET sku=?, barcode=?, name=?, description=?, category_id=?,
+                    price=?, cost=?, low_stock_threshold=?, active=?, updated_at=? WHERE id=?
+                """;
+        try (Connection connection = openConnection();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setString(1, product.sku());
+            statement.setString(2, product.barcode());
+            statement.setString(3, product.name());
+            statement.setString(4, product.description());
+            setNullableLong(statement, 5, product.categoryId());
+            statement.setBigDecimal(6, product.price());
+            statement.setBigDecimal(7, product.cost());
+            statement.setInt(8, product.lowStockThreshold());
+            statement.setBoolean(9, product.active());
+            statement.setString(10, Instant.now().toString());
+            statement.setLong(11, product.id());
+            if (statement.executeUpdate() == 0) {
+                throw new SQLException("No product exists with id " + product.id());
+            }
+            return getProduct(product.id()).orElseThrow(
+                    () -> new SQLException("Product disappeared while updating: " + product.id())
+            );
+        } catch (SQLException exception) {
+            logAndThrow("Unable to update product details", exception);
+            throw exception;
+        }
+    }
+
+    @Override
     public final Optional<Product> getProduct(long id) throws SQLException {
         return queryProduct("SELECT * FROM products WHERE id=?", statement -> statement.setLong(1, id));
     }
@@ -350,6 +400,12 @@ public abstract class JdbcStorage implements PosStorage {
     public final Optional<Product> getProductBySku(String sku) throws SQLException {
         Objects.requireNonNull(sku, "sku");
         return queryProduct("SELECT * FROM products WHERE sku=?", statement -> statement.setString(1, sku));
+    }
+
+    @Override
+    public final Optional<Product> getProductByBarcode(String barcode) throws SQLException {
+        Objects.requireNonNull(barcode, "barcode");
+        return queryProduct("SELECT * FROM products WHERE barcode=?", statement -> statement.setString(1, barcode));
     }
 
     @Override
@@ -365,6 +421,26 @@ public abstract class JdbcStorage implements PosStorage {
             return products;
         } catch (SQLException exception) {
             logAndThrow("Unable to list products", exception);
+            throw exception;
+        }
+    }
+
+    @Override
+    public final List<Product> listLowStockProducts() throws SQLException {
+        List<Product> products = new ArrayList<>();
+        try (Connection connection = openConnection();
+             PreparedStatement statement = connection.prepareStatement("""
+                     SELECT * FROM products
+                     WHERE active=TRUE AND stock_quantity<=low_stock_threshold
+                     ORDER BY stock_quantity ASC, name ASC
+                     """);
+             ResultSet result = statement.executeQuery()) {
+            while (result.next()) {
+                products.add(readProduct(result));
+            }
+            return products;
+        } catch (SQLException exception) {
+            logAndThrow("Unable to list low-stock products", exception);
             throw exception;
         }
     }
@@ -431,18 +507,7 @@ public abstract class JdbcStorage implements PosStorage {
             statement.setInt(2, limit);
             try (ResultSet result = statement.executeQuery()) {
                 while (result.next()) {
-                    long rawUserId = result.getLong("user_id");
-                    Long userId = result.wasNull() ? null : rawUserId;
-                    transactions.add(new InventoryTransaction(
-                            result.getLong("id"),
-                            result.getLong("product_id"),
-                            userId,
-                            result.getString("transaction_type"),
-                            result.getInt("quantity_delta"),
-                            result.getString("note"),
-                            result.getString("reference"),
-                            Instant.parse(result.getString("created_at"))
-                    ));
+                    transactions.add(readInventoryTransaction(result));
                 }
             }
             return transactions;
@@ -453,30 +518,92 @@ public abstract class JdbcStorage implements PosStorage {
     }
 
     @Override
-    public final SystemUser createUser(SystemUser user) throws SQLException {
-        Objects.requireNonNull(user, "user");
-        requireText(user.username(), "username");
-        requireText(user.passwordHash(), "passwordHash");
-        requireText(user.displayName(), "displayName");
-        requireText(user.role(), "role");
+    public final List<InventoryTransaction> getRecentInventoryTransactions(int limit) throws SQLException {
+        if (limit < 1) {
+            throw new IllegalArgumentException("Transaction limit must be positive");
+        }
         String sql = """
-                INSERT INTO system_users
-                (username, password_hash, display_name, role, active, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                SELECT id,product_id,user_id,transaction_type,quantity_delta,note,reference,created_at
+                FROM inventory_transactions ORDER BY id DESC LIMIT ?
                 """;
+        List<InventoryTransaction> transactions = new ArrayList<>();
         try (Connection connection = openConnection();
-             PreparedStatement statement = connection.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
-            statement.setString(1, user.username());
-            statement.setString(2, user.passwordHash());
-            statement.setString(3, user.displayName());
-            statement.setString(4, user.role());
-            statement.setBoolean(5, user.active());
-            statement.setString(6, Instant.now().toString());
-            statement.executeUpdate();
-            return new SystemUser(
-                    generatedId(statement), user.username(), user.passwordHash(),
-                    user.displayName(), user.role(), user.active()
-            );
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setInt(1, limit);
+            try (ResultSet result = statement.executeQuery()) {
+                while (result.next()) {
+                    transactions.add(readInventoryTransaction(result));
+                }
+            }
+            return transactions;
+        } catch (SQLException exception) {
+            logAndThrow("Unable to read recent inventory transactions", exception);
+            throw exception;
+        }
+    }
+
+    @Override
+    public final InventoryTransaction setInventoryCount(
+            long productId,
+            Long userId,
+            int countedQuantity,
+            String note,
+            String reference
+    ) throws SQLException {
+        if (countedQuantity < 0) {
+            throw new IllegalArgumentException("Counted inventory cannot be negative");
+        }
+        requireText(note, "count note");
+        Instant now = Instant.now();
+        try (Connection connection = openConnection()) {
+            connection.setAutoCommit(false);
+            try {
+                int previousQuantity;
+                try (PreparedStatement query = connection.prepareStatement(
+                        "SELECT stock_quantity FROM products WHERE id=?")) {
+                    query.setLong(1, productId);
+                    try (ResultSet result = query.executeQuery()) {
+                        if (!result.next()) {
+                            throw new SQLException("Product does not exist: " + productId);
+                        }
+                        previousQuantity = result.getInt("stock_quantity");
+                    }
+                }
+
+                int delta = countedQuantity - previousQuantity;
+                try (PreparedStatement update = connection.prepareStatement("""
+                        UPDATE products SET stock_quantity=?,updated_at=?
+                        WHERE id=? AND stock_quantity=?
+                        """)) {
+                    update.setInt(1, countedQuantity);
+                    update.setString(2, now.toString());
+                    update.setLong(3, productId);
+                    update.setInt(4, previousQuantity);
+                    if (update.executeUpdate() == 0) {
+                        throw new SQLException("Inventory changed during stock count; reload and recount");
+                    }
+                }
+
+                InventoryTransaction transaction = insertInventoryTransaction(
+                        connection, productId, userId, "COUNT", delta, note, reference, now
+                );
+                connection.commit();
+                return transaction;
+            } catch (SQLException | RuntimeException exception) {
+                rollback(connection, exception);
+                if (exception instanceof SQLException sqlException) {
+                    logAndThrow("Unable to save inventory count", sqlException);
+                }
+                throw exception;
+            }
+        }
+    }
+
+    @Override
+    public final SystemUser createUser(SystemUser user) throws SQLException {
+        validateUser(user);
+        try (Connection connection = openConnection()) {
+            return insertUser(connection, user);
         } catch (SQLException exception) {
             logAndThrow("Unable to create system user", exception);
             throw exception;
@@ -508,6 +635,180 @@ public abstract class JdbcStorage implements PosStorage {
             }
         } catch (SQLException exception) {
             logAndThrow("Unable to find system user", exception);
+            throw exception;
+        }
+    }
+
+    @Override
+    public final SystemUser createInitialAdmin(SystemUser admin) throws SQLException {
+        validateUser(admin);
+        if (!"ADMIN".equalsIgnoreCase(admin.role()) || !admin.active()) {
+            throw new IllegalArgumentException("Bootstrap account must be an active ADMIN");
+        }
+
+        try (Connection connection = openConnection()) {
+            connection.setAutoCommit(false);
+            try {
+                lockBootstrapRow(connection);
+                if (countUsers(connection) != 0) {
+                    throw new IllegalStateException("Initial administrator has already been created");
+                }
+                SystemUser created = insertUser(connection, admin);
+                connection.commit();
+                return created;
+            } catch (SQLException | RuntimeException exception) {
+                rollback(connection, exception);
+                if (exception instanceof SQLException sqlException) {
+                    logAndThrow("Unable to create initial administrator", sqlException);
+                }
+                throw exception;
+            }
+        }
+    }
+
+    @Override
+    public final Optional<UserAccount> getUserById(long id) throws SQLException {
+        String sql = "SELECT id,username,display_name,role,active FROM system_users WHERE id=?";
+        try (Connection connection = openConnection();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setLong(1, id);
+            try (ResultSet result = statement.executeQuery()) {
+                return result.next() ? Optional.of(readUserAccount(result)) : Optional.empty();
+            }
+        } catch (SQLException exception) {
+            logAndThrow("Unable to find system user", exception);
+            throw exception;
+        }
+    }
+
+    @Override
+    public final List<UserAccount> listUsers() throws SQLException {
+        List<UserAccount> users = new ArrayList<>();
+        try (Connection connection = openConnection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "SELECT id,username,display_name,role,active FROM system_users ORDER BY username");
+             ResultSet result = statement.executeQuery()) {
+            while (result.next()) {
+                users.add(readUserAccount(result));
+            }
+            return users;
+        } catch (SQLException exception) {
+            logAndThrow("Unable to list system users", exception);
+            throw exception;
+        }
+    }
+
+    @Override
+    public final int countUsers() throws SQLException {
+        try (Connection connection = openConnection()) {
+            return countUsers(connection);
+        } catch (SQLException exception) {
+            logAndThrow("Unable to count system users", exception);
+            throw exception;
+        }
+    }
+
+    @Override
+    public final int countActiveAdmins() throws SQLException {
+        try (Connection connection = openConnection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "SELECT COUNT(*) FROM system_users WHERE role='ADMIN' AND active=TRUE");
+             ResultSet result = statement.executeQuery()) {
+            result.next();
+            return result.getInt(1);
+        } catch (SQLException exception) {
+            logAndThrow("Unable to count active administrators", exception);
+            throw exception;
+        }
+    }
+
+    @Override
+    public final void updateUserRole(long id, String role) throws SQLException {
+        requireText(role, "role");
+        try (Connection connection = openConnection()) {
+            connection.setAutoCommit(false);
+            try {
+                lockUserBootstrap(connection);
+                boolean activeAdmin = isActiveAdmin(connection, id);
+                if (activeAdmin && !"ADMIN".equalsIgnoreCase(role) && countActiveAdmins(connection) <= 1) {
+                    throw new SQLException("Cannot demote the last active administrator");
+                }
+                try (PreparedStatement statement = connection.prepareStatement(
+                        "UPDATE system_users SET role=? WHERE id=?")) {
+                    statement.setString(1, role);
+                    statement.setLong(2, id);
+                    if (statement.executeUpdate() == 0) {
+                        throw new SQLException("No user exists with id " + id);
+                    }
+                }
+                connection.commit();
+            } catch (SQLException | RuntimeException exception) {
+                rollback(connection, exception);
+                throw exception;
+            }
+        } catch (SQLException exception) {
+            logAndThrow("Unable to update user role", exception);
+            throw exception;
+        }
+    }
+
+    @Override
+    public final void setUserActive(long id, boolean active) throws SQLException {
+        try (Connection connection = openConnection()) {
+            connection.setAutoCommit(false);
+            try {
+                lockUserBootstrap(connection);
+                if (!active && isActiveAdmin(connection, id) && countActiveAdmins(connection) <= 1) {
+                    throw new SQLException("Cannot deactivate the last active administrator");
+                }
+                try (PreparedStatement statement = connection.prepareStatement(
+                        "UPDATE system_users SET active=? WHERE id=?")) {
+                    statement.setBoolean(1, active);
+                    statement.setLong(2, id);
+                    if (statement.executeUpdate() == 0) {
+                        throw new SQLException("No user exists with id " + id);
+                    }
+                }
+                connection.commit();
+            } catch (SQLException | RuntimeException exception) {
+                rollback(connection, exception);
+                throw exception;
+            }
+        } catch (SQLException exception) {
+            logAndThrow("Unable to update user status", exception);
+            throw exception;
+        }
+    }
+
+    @Override
+    public final void updateUserPassword(long id, String passwordHash) throws SQLException {
+        requireText(passwordHash, "passwordHash");
+        try (Connection connection = openConnection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "UPDATE system_users SET password_hash=? WHERE id=?")) {
+            statement.setString(1, passwordHash);
+            statement.setLong(2, id);
+            if (statement.executeUpdate() == 0) {
+                throw new SQLException("No user exists with id " + id);
+            }
+        } catch (SQLException exception) {
+            logAndThrow("Unable to update user password", exception);
+            throw exception;
+        }
+    }
+
+    @Override
+    public final void updateUserLastLogin(long id) throws SQLException {
+        try (Connection connection = openConnection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "UPDATE system_users SET last_login_at=? WHERE id=? AND active=TRUE")) {
+            statement.setString(1, Instant.now().toString());
+            statement.setLong(2, id);
+            if (statement.executeUpdate() == 0) {
+                throw new SQLException("Active user does not exist: " + id);
+            }
+        } catch (SQLException exception) {
+            logAndThrow("Unable to update user login time", exception);
             throw exception;
         }
     }
@@ -821,8 +1122,8 @@ public abstract class JdbcStorage implements PosStorage {
         requireText(sale.saleNumber(), "saleNumber");
         Objects.requireNonNull(sale.lines(), "sale lines");
         Objects.requireNonNull(sale.payments(), "sale payments");
-        if (sale.lines().isEmpty() || sale.payments().isEmpty()) {
-            throw new IllegalArgumentException("A completed sale requires at least one item and one payment");
+        if (sale.lines().isEmpty()) {
+            throw new IllegalArgumentException("A completed sale requires at least one item");
         }
 
         BigDecimal subtotal = BigDecimal.ZERO;
@@ -852,7 +1153,11 @@ public abstract class JdbcStorage implements PosStorage {
             throw new IllegalArgumentException("Sale discount or tax amount is invalid");
         }
         BigDecimal total = subtotal.subtract(discount).add(tax);
+        if (sale.payments().isEmpty() && total.signum() != 0) {
+            throw new IllegalArgumentException("A sale with an amount due requires at least one payment");
+        }
         BigDecimal paymentsTotal = BigDecimal.ZERO;
+        BigDecimal cashPaymentsTotal = BigDecimal.ZERO;
         for (PaymentLine payment : sale.payments()) {
             Objects.requireNonNull(payment, "payment");
             requireText(payment.method(), "payment method");
@@ -861,9 +1166,15 @@ public abstract class JdbcStorage implements PosStorage {
                 throw new IllegalArgumentException("Payment amount must be greater than zero");
             }
             paymentsTotal = paymentsTotal.add(payment.amount());
+            if ("CASH".equalsIgnoreCase(payment.method())) {
+                cashPaymentsTotal = cashPaymentsTotal.add(payment.amount());
+            }
         }
-        if (paymentsTotal.compareTo(total) != 0) {
-            throw new IllegalArgumentException("Payment total must equal sale total");
+        BigDecimal changeDue = paymentsTotal.subtract(total);
+        if (changeDue.signum() < 0 || changeDue.compareTo(cashPaymentsTotal) > 0) {
+            throw new IllegalArgumentException(
+                    "Payment total must cover the sale; any change must come from cash tender"
+            );
         }
 
         Instant now = Instant.now();
@@ -959,7 +1270,139 @@ public abstract class JdbcStorage implements PosStorage {
     }
 
     @Override
+    public final Optional<SaleDetails> getSaleByNumber(String saleNumber) throws SQLException {
+        requireText(saleNumber, "saleNumber");
+        String headerSql = """
+                SELECT id, sale_number, customer_id, user_id, subtotal, discount_amount, tax_amount, total, created_at
+                FROM sales
+                WHERE sale_number=?
+                """;
+        try (Connection connection = openConnection()) {
+            SaleHeader saleHeader;
+            try (PreparedStatement header = connection.prepareStatement(headerSql)) {
+                header.setString(1, saleNumber);
+                try (ResultSet result = header.executeQuery()) {
+                    if (!result.next()) {
+                        return Optional.empty();
+                    }
+
+                    long rawCustomerId = result.getLong("customer_id");
+                    Long customerId = result.wasNull() ? null : rawCustomerId;
+                    SaleReceipt receipt = new SaleReceipt(
+                            result.getLong("id"),
+                            result.getString("sale_number"),
+                            result.getBigDecimal("subtotal"),
+                            result.getBigDecimal("discount_amount"),
+                            result.getBigDecimal("tax_amount"),
+                            result.getBigDecimal("total")
+                    );
+                    saleHeader = new SaleHeader(
+                            receipt,
+                            customerId,
+                            result.getLong("user_id"),
+                            Instant.parse(result.getString("created_at"))
+                    );
+                }
+            }
+
+            List<SaleLine> lines = new ArrayList<>();
+            try (PreparedStatement items = connection.prepareStatement("""
+                    SELECT product_id, sku, product_name, quantity, unit_price, discount_amount
+                    FROM sale_items
+                    WHERE sale_id=?
+                    ORDER BY id
+                    """)) {
+                items.setLong(1, saleHeader.receipt().id());
+                try (ResultSet itemResults = items.executeQuery()) {
+                    while (itemResults.next()) {
+                        lines.add(new SaleLine(
+                                itemResults.getLong("product_id"),
+                                itemResults.getString("sku"),
+                                itemResults.getString("product_name"),
+                                itemResults.getInt("quantity"),
+                                itemResults.getBigDecimal("unit_price"),
+                                itemResults.getBigDecimal("discount_amount")
+                        ));
+                    }
+                }
+            }
+
+            List<PaymentLine> payments = new ArrayList<>();
+            try (PreparedStatement paymentQuery = connection.prepareStatement("""
+                    SELECT method, amount, reference
+                    FROM payments
+                    WHERE sale_id=?
+                    ORDER BY id
+                    """)) {
+                paymentQuery.setLong(1, saleHeader.receipt().id());
+                try (ResultSet paymentResults = paymentQuery.executeQuery()) {
+                    while (paymentResults.next()) {
+                        payments.add(new PaymentLine(
+                                paymentResults.getString("method"),
+                                paymentResults.getBigDecimal("amount"),
+                                paymentResults.getString("reference")
+                        ));
+                    }
+                }
+            }
+            return Optional.of(new SaleDetails(
+                    saleHeader.receipt(),
+                    saleHeader.customerId(),
+                    saleHeader.userId(),
+                    saleHeader.createdAt(),
+                    lines,
+                    payments
+            ));
+        } catch (SQLException exception) {
+            logAndThrow("Unable to load sale receipt", exception);
+            throw exception;
+        }
+    }
+
+    @Override
+    public final List<SaleSummary> listRecentSales(int limit, Long userId) throws SQLException {
+        if (limit < 1 || limit > 500) {
+            throw new IllegalArgumentException("Sale history limit must be between 1 and 500");
+        }
+        String sql = """
+                SELECT id, sale_number, user_id, total, status, created_at
+                FROM sales
+                %s
+                ORDER BY id DESC
+                LIMIT ?
+                """.formatted(userId == null ? "" : "WHERE user_id=?");
+        List<SaleSummary> sales = new ArrayList<>();
+        try (Connection connection = openConnection();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+            int parameter = 1;
+            if (userId != null) {
+                statement.setLong(parameter++, userId);
+            }
+            statement.setInt(parameter, limit);
+            try (ResultSet result = statement.executeQuery()) {
+                while (result.next()) {
+                    sales.add(new SaleSummary(
+                            result.getLong("id"),
+                            result.getString("sale_number"),
+                            result.getLong("user_id"),
+                            result.getBigDecimal("total"),
+                            result.getString("status"),
+                            Instant.parse(result.getString("created_at"))
+                    ));
+                }
+            }
+            return sales;
+        } catch (SQLException exception) {
+            logAndThrow("Unable to list sales history", exception);
+            throw exception;
+        }
+    }
+
+    @Override
     public void close() throws SQLException {
+    }
+
+    private record SaleHeader(SaleReceipt receipt, Long customerId, long userId, Instant createdAt) {
     }
 
     private Optional<Product> queryProduct(String sql, Binder binder) throws SQLException {
@@ -975,6 +1418,79 @@ public abstract class JdbcStorage implements PosStorage {
         }
     }
 
+    private static UserAccount readUserAccount(ResultSet result) throws SQLException {
+        return new UserAccount(
+                result.getLong("id"),
+                result.getString("username"),
+                result.getString("display_name"),
+                result.getString("role"),
+                result.getBoolean("active")
+        );
+    }
+
+    private static void validateUser(SystemUser user) {
+        Objects.requireNonNull(user, "user");
+        requireText(user.username(), "username");
+        requireText(user.passwordHash(), "passwordHash");
+        requireText(user.displayName(), "displayName");
+        requireText(user.role(), "role");
+    }
+
+    private static SystemUser insertUser(Connection connection, SystemUser user) throws SQLException {
+        String sql = """
+                INSERT INTO system_users
+                (username,password_hash,display_name,role,active,created_at)
+                VALUES (?,?,?,?,?,?)
+                """;
+        try (PreparedStatement statement = connection.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
+            statement.setString(1, user.username());
+            statement.setString(2, user.passwordHash());
+            statement.setString(3, user.displayName());
+            statement.setString(4, user.role());
+            statement.setBoolean(5, user.active());
+            statement.setString(6, Instant.now().toString());
+            statement.executeUpdate();
+            return new SystemUser(
+                    generatedId(statement), user.username(), user.passwordHash(),
+                    user.displayName(), user.role(), user.active()
+            );
+        }
+    }
+
+    private static int countUsers(Connection connection) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement("SELECT COUNT(*) FROM system_users");
+             ResultSet result = statement.executeQuery()) {
+            result.next();
+            return result.getInt(1);
+        }
+    }
+
+    private static int countActiveAdmins(Connection connection) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement(
+                "SELECT COUNT(*) FROM system_users WHERE role='ADMIN' AND active=TRUE");
+             ResultSet result = statement.executeQuery()) {
+            result.next();
+            return result.getInt(1);
+        }
+    }
+
+    private static boolean isActiveAdmin(Connection connection, long userId) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement(
+                "SELECT role,active FROM system_users WHERE id=?")) {
+            statement.setLong(1, userId);
+            try (ResultSet result = statement.executeQuery()) {
+                if (!result.next()) {
+                    throw new SQLException("No user exists with id " + userId);
+                }
+                return "ADMIN".equalsIgnoreCase(result.getString("role")) && result.getBoolean("active");
+            }
+        }
+    }
+
+    private void lockUserBootstrap(Connection connection) throws SQLException {
+        lockBootstrapRow(connection);
+    }
+
     private static Product readProduct(ResultSet result) throws SQLException {
         long categoryId = result.getLong("category_id");
         Long nullableCategoryId = result.wasNull() ? null : categoryId;
@@ -984,6 +1500,21 @@ public abstract class JdbcStorage implements PosStorage {
                 result.getBigDecimal("price"), result.getBigDecimal("cost"),
                 result.getInt("stock_quantity"), result.getInt("low_stock_threshold"),
                 result.getBoolean("active")
+        );
+    }
+
+    private static InventoryTransaction readInventoryTransaction(ResultSet result) throws SQLException {
+        long rawUserId = result.getLong("user_id");
+        Long userId = result.wasNull() ? null : rawUserId;
+        return new InventoryTransaction(
+                result.getLong("id"),
+                result.getLong("product_id"),
+                userId,
+                result.getString("transaction_type"),
+                result.getInt("quantity_delta"),
+                result.getString("note"),
+                result.getString("reference"),
+                Instant.parse(result.getString("created_at"))
         );
     }
 

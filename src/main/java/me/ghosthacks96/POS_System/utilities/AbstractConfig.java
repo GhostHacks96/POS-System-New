@@ -128,6 +128,10 @@ public abstract class AbstractConfig {
         return value instanceof Map<?, ?> map ? stringKeyedMap(map) : Map.of();
     }
 
+    public final Map<String, Object> getValues() {
+        return snapshotValues();
+    }
+
     public final boolean contains(String path) {
         return find(path) != null;
     }

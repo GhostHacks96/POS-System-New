@@ -22,6 +22,7 @@ import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Supplier;
 
 import static me.ghosthacks96.POS_System.Users.Permission.APPLY_DISCOUNTS;
 import static me.ghosthacks96.POS_System.Users.Permission.PROCESS_SALES;
@@ -33,12 +34,20 @@ public final class SalesService {
     private static final int MAX_LINES = 100;
     private static final int MAX_QUANTITY_PER_LINE = 10_000;
 
-    private final PosStorage storage;
+    private final Supplier<PosStorage> storageProvider;
     private final UserService users;
 
     public SalesService(PosStorage storage, UserService users) {
-        this.storage = Objects.requireNonNull(storage, "storage");
+        this(() -> Objects.requireNonNull(storage, "storage"), users);
+    }
+
+    public SalesService(Supplier<PosStorage> storageProvider, UserService users) {
+        this.storageProvider = Objects.requireNonNull(storageProvider, "storageProvider");
         this.users = Objects.requireNonNull(users, "users");
+    }
+
+    private PosStorage storage() {
+        return Objects.requireNonNull(storageProvider.get(), "storageProvider returned null");
     }
 
     public CheckoutResult checkout(
@@ -52,7 +61,7 @@ public final class SalesService {
         UserPrincipal currentActor = requirePermission(actor, PROCESS_SALES);
         validateSaleNumber(saleNumber);
 
-        Optional<SaleDetails> existing = storage.getSaleByNumber(saleNumber);
+        Optional<SaleDetails> existing = storage().getSaleByNumber(saleNumber);
         if (existing.isPresent()) {
             return replayOrReject(
                     existing.get(), currentActor, saleNumber, customerId, requestedDiscount, cart, tenders
@@ -63,12 +72,12 @@ public final class SalesService {
                 currentActor, saleNumber, customerId, requestedDiscount, cart, tenders
         );
         try {
-            SaleReceipt receipt = storage.completeSale(draft);
-            SaleDetails details = storage.getSaleByNumber(receipt.saleNumber())
+            SaleReceipt receipt = storage().completeSale(draft);
+            SaleDetails details = storage().getSaleByNumber(receipt.saleNumber())
                     .orElseThrow(() -> new SQLException("Completed sale could not be reloaded"));
             return new CheckoutResult(details, cashChangeDue(details), false);
         } catch (SQLException exception) {
-            Optional<SaleDetails> committedByConcurrentRequest = storage.getSaleByNumber(saleNumber);
+            Optional<SaleDetails> committedByConcurrentRequest = storage().getSaleByNumber(saleNumber);
             if (committedByConcurrentRequest.isPresent()) {
                 return replayOrReject(
                         committedByConcurrentRequest.get(),
@@ -92,7 +101,7 @@ public final class SalesService {
             throw new SecurityException("Permission denied");
         }
 
-        SaleDetails details = storage.getSaleByNumber(saleNumber)
+        SaleDetails details = storage().getSaleByNumber(saleNumber)
                 .orElseThrow(() -> new SaleNotFoundException("Sale receipt not found"));
         if (!canViewAll && details.userId() != currentActor.id()) {
             throw new SecurityException("Permission denied");
@@ -106,10 +115,10 @@ public final class SalesService {
         }
         UserPrincipal currentActor = Objects.requireNonNull(actor, "actor");
         if (users.hasPermission(currentActor, VIEW_REPORTS)) {
-            return storage.listRecentSales(limit, null);
+            return storage().listRecentSales(limit, null);
         }
         if (users.hasPermission(currentActor, PROCESS_SALES)) {
-            return storage.listRecentSales(limit, currentActor.id());
+            return storage().listRecentSales(limit, currentActor.id());
         }
         throw new SecurityException("Permission denied");
     }
@@ -145,7 +154,7 @@ public final class SalesService {
             throw new IllegalArgumentException("A sale cannot contain more than 10 tenders");
         }
         if (customerId != null) {
-            if (customerId <= 0 || storage.getCustomer(customerId).isEmpty()) {
+            if (customerId <= 0 || storage().getCustomer(customerId).isEmpty()) {
                 throw new IllegalArgumentException("Customer does not exist");
             }
         }
@@ -164,7 +173,7 @@ public final class SalesService {
                 throw new IllegalArgumentException("Each product may appear only once in the cart");
             }
 
-            Product product = storage.getProduct(item.productId())
+            Product product = storage().getProduct(item.productId())
                     .orElseThrow(() -> new IllegalArgumentException("Product does not exist"));
             if (!product.active()) {
                 throw new IllegalArgumentException("Product is inactive: " + product.sku());

@@ -26,16 +26,28 @@ import java.security.SecureRandom;
 import java.sql.SQLException;
 import java.time.Instant;
 import java.util.Base64;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.LinkedHashSet;
+import java.util.regex.Pattern;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public final class ApiServer implements AutoCloseable {
     private static final String API_PREFIX = "/api/v1";
     private static final String ACTOR_ATTRIBUTE = ApiServer.class.getName() + ".actor";
+    private static final String STORAGE_LOCK_ATTRIBUTE = ApiServer.class.getName() + ".storageLock";
+    private static final String RELOAD_CONFIG_PATH = API_PREFIX + "/system/reload-config";
+    private static final String RELOAD_STORAGE_PATH = API_PREFIX + "/system/reload-storage";
     private static final SecureRandom RANDOM = new SecureRandom();
+    private static final Pattern SECRET_CONFIG_KEY =
+            Pattern.compile("(?i).*(password|passwd|pass|secret|token|credential|private[-_]?key|api[-_]?key|username|user).*");
+    private static final Pattern URL_USER_INFO = Pattern.compile("(?i)(https?://)[^/@\\s]+@");
+    private static final String REDACTED = "[REDACTED]";
 
     private final InventoryService inventory;
     private final SalesService sales;
@@ -44,7 +56,9 @@ public final class ApiServer implements AutoCloseable {
     private final Logger logger;
     private final String version;
     private final long sessionTtlSeconds;
+    private final SystemControl systemControl;
     private final Map<String, Session> sessions = new ConcurrentHashMap<>();
+    private final ReentrantReadWriteLock storageLifecycleLock = new ReentrantReadWriteLock();
     private Javalin app;
 
     public ApiServer(
@@ -56,12 +70,26 @@ public final class ApiServer implements AutoCloseable {
             String version,
             long sessionTtlSeconds
     ) {
+        this(inventory, sales, users, config, logger, version, sessionTtlSeconds, SystemControl.unavailable());
+    }
+
+    public ApiServer(
+            InventoryService inventory,
+            SalesService sales,
+            UserService users,
+            AbstractConfig config,
+            Logger logger,
+            String version,
+            long sessionTtlSeconds,
+            SystemControl systemControl
+    ) {
         this.inventory = Objects.requireNonNull(inventory, "inventory");
         this.sales = Objects.requireNonNull(sales, "sales");
         this.users = Objects.requireNonNull(users, "users");
         this.config = Objects.requireNonNull(config, "config");
         this.logger = Objects.requireNonNull(logger, "logger");
         this.version = Objects.requireNonNull(version, "version");
+        this.systemControl = Objects.requireNonNull(systemControl, "systemControl");
         if (sessionTtlSeconds < 300 || sessionTtlSeconds > 86_400) {
             throw new IllegalArgumentException("Session TTL must be between five minutes and 24 hours");
         }
@@ -110,14 +138,28 @@ public final class ApiServer implements AutoCloseable {
                 return;
             }
             String path = ctx.path();
-            if ((API_PREFIX + "/health").equals(path)
-                    || ((API_PREFIX + "/auth/login").equals(path) && "POST".equals(ctx.method().name()))) {
+            if (isLifecyclePath(path, ctx.method().name())) {
                 return;
             }
-            authenticateRequest(ctx);
+            storageLifecycleLock.readLock().lock();
+            ctx.attribute(STORAGE_LOCK_ATTRIBUTE, true);
+            try {
+                if ((API_PREFIX + "/health").equals(path)
+                        || ((API_PREFIX + "/auth/login").equals(path) && "POST".equals(ctx.method().name()))) {
+                    return;
+                }
+                authenticateRequest(ctx);
+            } catch (SQLException | RuntimeException exception) {
+                releaseStorageReadLock(ctx);
+                throw exception;
+            }
         });
+        server.after(this::releaseStorageReadLock);
 
-        server.exception(Exception.class, (exception, ctx) -> handleException(exception, ctx));
+        server.exception(Exception.class, (exception, ctx) -> {
+            releaseStorageReadLock(ctx);
+            handleException(exception, ctx);
+        });
         server.error(404, ctx -> ctx.json(new ApiError("not_found", "Endpoint not found")));
 
         server.get(API_PREFIX + "/health", ctx -> ctx.json(Map.of("status", "ok")));
@@ -336,6 +378,55 @@ public final class ApiServer implements AutoCloseable {
             config.save();
             ctx.json(new PublicSettings(storeName, version));
         });
+        server.get(API_PREFIX + "/system/config", ctx -> {
+            requirePermission(ctx, Permission.ADMINISTER_SYSTEM);
+            ctx.json(new SystemConfigResponse(
+                    config.getBoolean("debug", false),
+                    sanitizedConfig(config.getValues())
+            ));
+        });
+        server.put(API_PREFIX + "/system/debug", ctx -> {
+            requirePermission(ctx, Permission.ADMINISTER_SYSTEM);
+            DebugModeRequest request = ctx.bodyAsClass(DebugModeRequest.class);
+            if (request == null || request.enabled() == null) {
+                throw new IllegalArgumentException("Debug mode state is required");
+            }
+            config.set("debug", request.enabled());
+            config.save();
+            systemControl.setDebugEnabled(request.enabled());
+            ctx.json(new DebugModeResponse(request.enabled()));
+        });
+        server.get(API_PREFIX + "/system/logs", ctx -> {
+            requirePermission(ctx, Permission.ADMINISTER_SYSTEM);
+            long after = parseLogCursor(ctx.queryParam("after"));
+            ctx.json(new LogEntriesResponse(logger.entriesAfter(after)));
+        });
+        server.post(RELOAD_CONFIG_PATH, ctx -> {
+            storageLifecycleLock.writeLock().lock();
+            try {
+                authenticateRequest(ctx);
+                requirePermission(ctx, Permission.ADMINISTER_SYSTEM);
+                ctx.json(systemControl.reloadConfiguration());
+            } finally {
+                storageLifecycleLock.writeLock().unlock();
+            }
+        });
+        server.post(RELOAD_STORAGE_PATH, ctx -> {
+            storageLifecycleLock.writeLock().lock();
+            try {
+                authenticateRequest(ctx);
+                requirePermission(ctx, Permission.ADMINISTER_SYSTEM);
+                ctx.json(systemControl.reloadStorage());
+            } finally {
+                storageLifecycleLock.writeLock().unlock();
+            }
+        });
+        server.post(API_PREFIX + "/system/shutdown", ctx -> {
+            requirePermission(ctx, Permission.ADMINISTER_SYSTEM);
+            ctx.status(202).json(new MessageResponse("Backend shutdown scheduled"));
+            ctx.res().flushBuffer();
+            systemControl.shutdown();
+        });
     }
 
     private void authenticateRequest(io.javalin.http.Context ctx) throws SQLException {
@@ -357,6 +448,18 @@ public final class ApiServer implements AutoCloseable {
             throw new AuthenticationException("Authentication required");
         }
         ctx.attribute(ACTOR_ATTRIBUTE, principal);
+    }
+
+    private void releaseStorageReadLock(io.javalin.http.Context ctx) {
+        if (Boolean.TRUE.equals(ctx.attribute(STORAGE_LOCK_ATTRIBUTE))) {
+            ctx.attribute(STORAGE_LOCK_ATTRIBUTE, false);
+            storageLifecycleLock.readLock().unlock();
+        }
+    }
+
+    private static boolean isLifecyclePath(String path, String method) {
+        return "POST".equals(method)
+                && (RELOAD_CONFIG_PATH.equals(path) || RELOAD_STORAGE_PATH.equals(path));
     }
 
     private UserPrincipal requirePermission(io.javalin.http.Context ctx, Permission permission)
@@ -520,6 +623,55 @@ public final class ApiServer implements AutoCloseable {
         throw new IllegalArgumentException(name + " must be true or false");
     }
 
+    private static long parseLogCursor(String value) {
+        if (value == null) {
+            return 0;
+        }
+        try {
+            long cursor = Long.parseLong(value);
+            if (cursor < 0) {
+                throw new NumberFormatException();
+            }
+            return cursor;
+        } catch (NumberFormatException exception) {
+            throw new IllegalArgumentException("Log cursor must be a non-negative integer");
+        }
+    }
+
+    private static Map<String, Object> sanitizedConfig(Map<String, Object> values) {
+        Map<String, Object> sanitized = new LinkedHashMap<>();
+        values.forEach((key, value) -> sanitized.put(
+                key,
+                SECRET_CONFIG_KEY.matcher(key).matches() ? REDACTED : sanitizeConfigValue(value)
+        ));
+        return sanitized;
+    }
+
+    private static Object sanitizeConfigValue(Object value) {
+        if (value instanceof Map<?, ?> map) {
+            Map<String, Object> sanitized = new LinkedHashMap<>();
+            map.forEach((key, nestedValue) -> {
+                String name = String.valueOf(key);
+                sanitized.put(
+                        name,
+                        SECRET_CONFIG_KEY.matcher(name).matches() ? REDACTED : sanitizeConfigValue(nestedValue)
+                );
+            });
+            return sanitized;
+        }
+        if (value instanceof Collection<?> collection) {
+            List<Object> sanitized = new ArrayList<>(collection.size());
+            for (Object nestedValue : collection) {
+                sanitized.add(sanitizeConfigValue(nestedValue));
+            }
+            return sanitized;
+        }
+        if (value instanceof String string) {
+            return URL_USER_INFO.matcher(string).replaceAll("$1[REDACTED]@");
+        }
+        return value;
+    }
+
     private static UserRole parseRole(String role) {
         if (role == null) {
             throw new IllegalArgumentException("Role is required");
@@ -553,6 +705,43 @@ public final class ApiServer implements AutoCloseable {
     }
 
     private record Session(long userId, Instant expiresAt) {
+    }
+
+    public interface SystemControl {
+        OperationResult reloadConfiguration();
+
+        OperationResult reloadStorage() throws SQLException;
+
+        void setDebugEnabled(boolean enabled);
+
+        void shutdown();
+
+        static SystemControl unavailable() {
+            return new SystemControl() {
+                @Override
+                public OperationResult reloadConfiguration() {
+                    throw new IllegalStateException("Backend controls are unavailable");
+                }
+
+                @Override
+                public OperationResult reloadStorage() {
+                    throw new IllegalStateException("Backend controls are unavailable");
+                }
+
+                @Override
+                public void setDebugEnabled(boolean enabled) {
+                    throw new IllegalStateException("Backend controls are unavailable");
+                }
+
+                @Override
+                public void shutdown() {
+                    throw new IllegalStateException("Backend controls are unavailable");
+                }
+            };
+        }
+    }
+
+    public record OperationResult(String message, boolean restartRequired) {
     }
 
     private record LoginRequest(String username, String password) {
@@ -643,6 +832,18 @@ public final class ApiServer implements AutoCloseable {
     }
 
     private record SettingsUpdateRequest(String storeName) {
+    }
+
+    private record DebugModeRequest(Boolean enabled) {
+    }
+
+    private record SystemConfigResponse(boolean debugEnabled, Map<String, Object> values) {
+    }
+
+    private record DebugModeResponse(boolean enabled) {
+    }
+
+    private record LogEntriesResponse(List<Logger.LogEntry> entries) {
     }
 
     private record PublicSettings(String storeName, String version) {

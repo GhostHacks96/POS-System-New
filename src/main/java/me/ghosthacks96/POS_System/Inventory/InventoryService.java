@@ -6,15 +6,24 @@ import java.sql.SQLException;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.Supplier;
 
 import static me.ghosthacks96.POS_System.Storage.PosData.InventoryTransaction;
 import static me.ghosthacks96.POS_System.Storage.PosData.Product;
 
 public final class InventoryService {
-    private final PosStorage storage;
+    private final Supplier<PosStorage> storageProvider;
 
     public InventoryService(PosStorage storage) {
-        this.storage = Objects.requireNonNull(storage, "storage");
+        this(() -> Objects.requireNonNull(storage, "storage"));
+    }
+
+    public InventoryService(Supplier<PosStorage> storageProvider) {
+        this.storageProvider = Objects.requireNonNull(storageProvider, "storageProvider");
+    }
+
+    private PosStorage storage() {
+        return Objects.requireNonNull(storageProvider.get(), "storageProvider returned null");
     }
 
     public Product createProduct(Product product) throws SQLException {
@@ -27,7 +36,7 @@ public final class InventoryService {
                     "Create products with zero stock, then use receiveStock to record initial inventory"
             );
         }
-        return storage.saveProduct(product);
+        return storage().saveProduct(product);
     }
 
     public Product updateProduct(Product product) throws SQLException {
@@ -35,7 +44,7 @@ public final class InventoryService {
         if (product.id() <= 0) {
             throw new IllegalArgumentException("Updated products must have a valid ID");
         }
-        Product current = storage.getProduct(product.id())
+        Product current = storage().getProduct(product.id())
                 .orElseThrow(() -> new IllegalArgumentException("Product does not exist: " + product.id()));
         Product metadataOnly = new Product(
                 product.id(),
@@ -50,25 +59,30 @@ public final class InventoryService {
                 product.lowStockThreshold(),
                 product.active()
         );
-        return storage.updateProductDetails(metadataOnly);
+        return storage().updateProductDetails(metadataOnly);
     }
 
     public Optional<Product> findBySku(String sku) throws SQLException {
         requireText(sku, "SKU");
-        return storage.getProductBySku(sku);
+        return storage().getProductBySku(sku);
     }
 
     public Optional<Product> findByBarcode(String barcode) throws SQLException {
         requireText(barcode, "barcode");
-        return storage.getProductByBarcode(barcode);
+        return storage().getProductByBarcode(barcode);
+    }
+
+    public Optional<Product> getProduct(long productId) throws SQLException {
+        requireProductId(productId);
+        return storage().getProduct(productId);
     }
 
     public List<Product> listProducts(boolean activeOnly) throws SQLException {
-        return storage.listProducts(activeOnly);
+        return storage().listProducts(activeOnly);
     }
 
     public List<Product> listLowStockProducts() throws SQLException {
-        return storage.listLowStockProducts();
+        return storage().listLowStockProducts();
     }
 
     public InventoryTransaction receiveStock(
@@ -81,7 +95,7 @@ public final class InventoryService {
         requireProductId(productId);
         requirePositiveQuantity(quantity);
         requireText(reason, "stock receipt reason");
-        return storage.adjustInventory(productId, userId, quantity, "RESTOCK", reason, normalize(reference));
+        return storage().adjustInventory(productId, userId, quantity, "RESTOCK", reason, normalize(reference));
     }
 
     public InventoryTransaction removeStock(
@@ -96,7 +110,7 @@ public final class InventoryService {
         requirePositiveQuantity(quantity);
         Objects.requireNonNull(reason, "reason");
         requireText(note, "removal note");
-        return storage.adjustInventory(
+        return storage().adjustInventory(
                 productId, userId, -quantity, reason.name(), note, normalize(reference)
         );
     }
@@ -113,7 +127,7 @@ public final class InventoryService {
             throw new IllegalArgumentException("Stock adjustment must change the quantity");
         }
         requireText(reason, "adjustment reason");
-        return storage.adjustInventory(
+        return storage().adjustInventory(
                 productId, userId, quantityDelta, "ADJUSTMENT", reason, normalize(reference)
         );
     }
@@ -130,18 +144,18 @@ public final class InventoryService {
             throw new IllegalArgumentException("Counted inventory cannot be negative");
         }
         requireText(note, "count note");
-        return storage.setInventoryCount(productId, userId, countedQuantity, note, normalize(reference));
+        return storage().setInventoryCount(productId, userId, countedQuantity, note, normalize(reference));
     }
 
     public List<InventoryTransaction> getProductHistory(long productId, int limit) throws SQLException {
         requireProductId(productId);
         requirePositiveQuantity(limit);
-        return storage.getInventoryTransactions(productId, limit);
+        return storage().getInventoryTransactions(productId, limit);
     }
 
     public List<InventoryTransaction> getRecentHistory(int limit) throws SQLException {
         requirePositiveQuantity(limit);
-        return storage.getRecentInventoryTransactions(limit);
+        return storage().getRecentInventoryTransactions(limit);
     }
 
     private static void requireProductId(long productId) {
