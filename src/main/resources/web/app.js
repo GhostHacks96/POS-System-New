@@ -351,8 +351,12 @@ async function renderSettings() {
         <section class="panel settings-card">
             <div class="panel-heading"><div><h2>Store profile</h2><p>GhostPOS ${escapeHtml(settings.version)}</p></div></div>
             <p class="settings-note">Database credentials, API binding, and other operational secrets are intentionally not exposed through the management UI.</p>
-            <form id="settings-form" class="inline-form">
-                <div class="form-field"><label for="setting-store-name">Store name</label><input id="setting-store-name" name="storeName" maxlength="100" required value="${escapeHtml(settings.storeName)}"></div>
+            <form id="settings-form">
+                <div class="form-grid">
+                    <div class="form-field"><label for="setting-store-name">Store name</label><input id="setting-store-name" name="storeName" maxlength="100" required value="${escapeHtml(settings.storeName)}"></div>
+                    <div class="form-field"><label for="setting-store-phone">Phone number</label><input id="setting-store-phone" name="phone" type="tel" maxlength="40" autocomplete="tel" value="${escapeHtml(settings.phone)}"></div>
+                    <div class="form-field full"><label for="setting-store-address">Address</label><input id="setting-store-address" name="address" maxlength="500" autocomplete="street-address" value="${escapeHtml(settings.address)}"></div>
+                </div>
                 <button class="btn btn-primary" type="submit">Save changes</button>
             </form>
         </section>
@@ -490,6 +494,8 @@ async function showReceipt(saleNumber) {
     showModal("Sale receipt", `Receipt ${sale.saleNumber} · ${dateTime(receipt.issuedAt)}`, `
         <article class="receipt-paper">
             <h2 class="receipt-title">${escapeHtml(receipt.storeName)}</h2>
+            ${receipt.storeAddress ? `<p class="receipt-meta">${escapeHtml(receipt.storeAddress)}</p>` : ""}
+            ${receipt.storePhone ? `<p class="receipt-meta">${escapeHtml(receipt.storePhone)}</p>` : ""}
             <p class="receipt-meta">GhostPOS · ${escapeHtml(receipt.systemVersion)}</p>
             <p class="receipt-meta">${escapeHtml(sale.saleNumber)} · ${escapeHtml(dateTime(receipt.issuedAt))}</p>
             <hr class="receipt-rule">${itemRows}<hr class="receipt-rule">
@@ -509,7 +515,10 @@ async function submitForm(form) {
     const values = Object.fromEntries(data.entries());
     const action = form.id;
     if (action === "settings-form") {
-        const settings = await api("/settings", { method: "PATCH", body: { storeName: values.storeName } });
+        const settings = await api("/settings", {
+            method: "PATCH",
+            body: { storeName: values.storeName, address: values.address, phone: values.phone }
+        });
         state.storeName = settings.storeName;
         document.getElementById("store-name").textContent = settings.storeName;
         setNotice("Store settings saved.");
@@ -676,7 +685,7 @@ viewRoot.addEventListener("click", async event => {
     }
 });
 
-viewRoot.addEventListener("submit", async event => {
+async function handleFormSubmit(event) {
     const form = event.target.closest("form");
     if (!form) return;
     event.preventDefault();
@@ -689,7 +698,10 @@ viewRoot.addEventListener("submit", async event => {
     } finally {
         if (submit?.isConnected) submit.disabled = false;
     }
-});
+}
+
+viewRoot.addEventListener("submit", handleFormSubmit);
+modal.addEventListener("submit", handleFormSubmit);
 
 modal.addEventListener("click", event => {
     if (event.target === modal) closeModal();

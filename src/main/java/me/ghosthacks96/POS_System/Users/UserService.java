@@ -1,5 +1,6 @@
 package me.ghosthacks96.POS_System.Users;
 
+import me.ghosthacks96.POS_System.POS_System;
 import me.ghosthacks96.POS_System.Storage.PosStorage;
 
 import org.mindrot.jbcrypt.BCrypt;
@@ -41,6 +42,7 @@ public final class UserService {
 
     public UserPrincipal createInitialAdmin(String username, char[] password, String displayName)
             throws SQLException {
+        POS_System.log.debug("Users: validating initial administrator details");
         try {
             String normalizedUsername = normalizeUsername(username);
             validatePassword(password);
@@ -49,6 +51,7 @@ public final class UserService {
             SystemUser created = storage().createInitialAdmin(new SystemUser(
                     0, normalizedUsername, passwordHash, normalizedDisplayName, UserRole.ADMIN.name(), true
             ));
+            POS_System.log.debug("Users: initial administrator created id=" + created.id());
             return toPrincipal(created);
         } finally {
             if (password != null) {
@@ -58,7 +61,10 @@ public final class UserService {
     }
 
     public boolean isInitialAdminRequired() throws SQLException {
-        return storage().countUsers() == 0;
+        POS_System.log.debug("Users: checking whether initial administrator setup is required");
+        boolean required = storage().countUsers() == 0;
+        POS_System.log.debug("Users: initial administrator setup " + (required ? "is required" : "is complete"));
+        return required;
     }
 
     public Optional<UserPrincipal> authenticate(String username, char[] password) throws SQLException {
@@ -72,6 +78,7 @@ public final class UserService {
     }
 
     private Optional<UserPrincipal> authenticatePassword(String username, char[] password) throws SQLException {
+        POS_System.log.debug("Users: validating sign-in credentials");
         String normalizedUsername;
         try {
             normalizedUsername = normalizeUsername(username);
@@ -99,11 +106,15 @@ public final class UserService {
             passwordMatches = false;
         }
         if (!passwordMatches || !user.active()) {
+            POS_System.log.debug("Users: sign-in rejected");
             return Optional.empty();
         }
 
+        POS_System.log.debug("Users: credentials accepted; recording last sign-in");
         storage().updateUserLastLogin(user.id());
-        return storage().getUserById(user.id()).map(this::toPrincipal);
+        Optional<UserPrincipal> principal = storage().getUserById(user.id()).map(this::toPrincipal);
+        POS_System.log.debug("Users: sign-in completed");
+        return principal;
     }
 
     public boolean hasPermission(UserPrincipal actor, Permission permission) throws SQLException {
@@ -112,6 +123,7 @@ public final class UserService {
     }
 
     public UserPrincipal getActiveUser(long userId) throws SQLException {
+        POS_System.log.debug("Users: refreshing active account id=" + userId);
         UserPrincipal user = storage().getUserById(userId)
                 .map(this::toPrincipal)
                 .orElseThrow(() -> new SecurityException("User account no longer exists"));
@@ -122,8 +134,11 @@ public final class UserService {
     }
 
     public List<UserPrincipal> listUsers(UserPrincipal actor) throws SQLException {
+        POS_System.log.debug("Users: checking permission and loading user list");
         requirePermission(actor, Permission.VIEW_USERS);
-        return storage().listUsers().stream().map(this::toPrincipal).toList();
+        List<UserPrincipal> result = storage().listUsers().stream().map(this::toPrincipal).toList();
+        POS_System.log.debug("Users: returned " + result.size() + " accounts");
+        return result;
     }
 
     public UserPrincipal createUser(
@@ -133,6 +148,7 @@ public final class UserService {
             String displayName,
             UserRole role
     ) throws SQLException {
+        POS_System.log.debug("Users: validating request to create account");
         try {
             UserPrincipal currentActor = requirePermission(actor, Permission.MANAGE_USERS);
             Objects.requireNonNull(role, "role");
@@ -148,6 +164,7 @@ public final class UserService {
                     role.name(),
                     true
             ));
+            POS_System.log.debug("Users: created account id=" + created.id() + " role=" + role);
             return toPrincipal(created);
         } finally {
             if (password != null) {
@@ -157,6 +174,7 @@ public final class UserService {
     }
 
     public UserPrincipal changeRole(UserPrincipal actor, long targetUserId, UserRole newRole) throws SQLException {
+        POS_System.log.debug("Users: validating role change for account id=" + targetUserId);
         UserPrincipal currentActor = requirePermission(actor, Permission.MANAGE_USERS);
         Objects.requireNonNull(newRole, "newRole");
         if (currentActor.id() == targetUserId) {
@@ -171,10 +189,13 @@ public final class UserService {
             throw new IllegalStateException("Cannot demote the last active administrator");
         }
         storage().updateUserRole(targetUserId, newRole.name());
-        return findUser(targetUserId);
+        UserPrincipal updated = findUser(targetUserId);
+        POS_System.log.debug("Users: role changed for account id=" + targetUserId);
+        return updated;
     }
 
     public UserPrincipal setUserActive(UserPrincipal actor, long targetUserId, boolean active) throws SQLException {
+        POS_System.log.debug("Users: validating active-state change for account id=" + targetUserId);
         UserPrincipal currentActor = requirePermission(actor, Permission.MANAGE_USERS);
         if (currentActor.id() == targetUserId && !active) {
             throw new SecurityException("You cannot deactivate your own account");
@@ -188,11 +209,15 @@ public final class UserService {
             throw new IllegalStateException("Cannot deactivate the last active administrator");
         }
         storage().setUserActive(targetUserId, active);
-        return findUser(targetUserId);
+        UserPrincipal updated = findUser(targetUserId);
+        POS_System.log.debug("Users: account id=" + targetUserId + " is now "
+                + (active ? "active" : "inactive"));
+        return updated;
     }
 
     public void changeOwnPassword(UserPrincipal actor, char[] currentPassword, char[] newPassword)
             throws SQLException {
+        POS_System.log.debug("Users: validating current password before password change");
         try {
             UserPrincipal currentActor = currentActor(actor);
             Optional<SystemUser> user = storage().getUserByUsername(currentActor.username());
@@ -202,6 +227,7 @@ public final class UserService {
             }
             validatePassword(newPassword);
             storage().updateUserPassword(currentActor.id(), hashPassword(newPassword));
+            POS_System.log.debug("Users: password updated for account id=" + currentActor.id());
         } finally {
             if (currentPassword != null) {
                 Arrays.fill(currentPassword, '\0');
@@ -213,6 +239,7 @@ public final class UserService {
     }
 
     public void resetPassword(UserPrincipal actor, long targetUserId, char[] newPassword) throws SQLException {
+        POS_System.log.debug("Users: validating password reset for account id=" + targetUserId);
         try {
             UserPrincipal currentActor = requirePermission(actor, Permission.MANAGE_USERS);
             UserPrincipal target = findUser(targetUserId);
@@ -221,6 +248,7 @@ public final class UserService {
             }
             validatePassword(newPassword);
             storage().updateUserPassword(targetUserId, hashPassword(newPassword));
+            POS_System.log.debug("Users: password reset for account id=" + targetUserId);
         } finally {
             if (newPassword != null) {
                 Arrays.fill(newPassword, '\0');

@@ -55,8 +55,10 @@ public class POS_System {
     }
 
     private static void closeResources() {
+        log.debug("Shutdown: beginning graceful resource cleanup");
         if (managementWebServer != null) {
             try {
+                log.debug("Shutdown: stopping management web interface");
                 managementWebServer.close();
             } catch (RuntimeException exception) {
                 log.severe("Unable to stop management web interface: " + exception.getClass().getSimpleName());
@@ -64,16 +66,19 @@ public class POS_System {
         }
         if (apiServer != null) {
             try {
+                log.debug("Shutdown: stopping register API");
                 apiServer.close();
             } catch (RuntimeException exception) {
                 log.severe("Unable to stop register API: " + exception.getClass().getSimpleName());
             }
         }
         try {
+            log.debug("Shutdown: closing POS storage");
             storageManager.close();
         } catch (SQLException exception) {
             log.severe("Unable to close POS storage: " + exception.getMessage());
         } finally {
+            log.debug("Shutdown: closing application logger");
             log.close();
         }
     }
@@ -94,11 +99,14 @@ public class POS_System {
 
     public static void main(String[] args){
         log.info(SystemName+" is starting up. Loading System Properties...");
+        log.debug("Startup: registering application configuration");
         config = configManager.register(new AbstractConfig("config.yml") {
             @Override
             protected void loadDefaults() {
                 set("debug", false);
                 set("store-name", "Demo-Store");
+                set("store-address", "");
+                set("store-phone", "");
                 set("storage-type", "sqlite");
                 set("mysql.ip", "localhost");
                 set("mysql.port", 3306);
@@ -121,17 +129,23 @@ public class POS_System {
         });
 
         RuntimeConfig runtimeConfig = readRuntimeConfig();
+        log.debug("Startup: validated runtime configuration");
         applyRuntimeConfig(runtimeConfig);
         activeRuntimeConfig = runtimeConfig;
+        log.debug("Startup: runtime configuration applied (storage=" + StorageType
+                + ", apiEnabled=" + runtimeConfig.apiEnabled() + ", webEnabled=" + runtimeConfig.webEnabled() + ")");
 
         try {
             log.debug("Loading POS storage: " + StorageType + "...");
             storageManager.loadStorage(StorageType, ip, port, user, pass, db);
             log.debug("POS storage loaded successfully. Launching Inventory Service...");
             inventoryService = new InventoryService(storageManager::getStorage);
+            log.debug("Startup: inventory service ready");
             log.debug("Inventory Service launched successfully. Launching User Authentication Service...");
             userService = new UserService(storageManager::getStorage);
+            log.debug("Startup: user service ready; launching sales service");
             salesService = new SalesService(storageManager::getStorage, userService);
+            log.debug("Startup: sales service ready");
             log.info("User authorization service is ready");
         } catch (SQLException exception) {
             log.severe("Unable to start POS storage: " + exception.getMessage());
@@ -140,9 +154,13 @@ public class POS_System {
 
         try {
             if (args.length == 1 && "--create-admin".equals(args[0])) {
+                log.debug("Startup: initial administrator bootstrap requested");
                 bootstrapAdmin();
-            } else if (userService.isInitialAdminRequired()) {
-                log.warning("No users exist. Run GhostPOS with --create-admin in an interactive terminal to create the first administrator.");
+            } else {
+                log.debug("Startup: checking administrator bootstrap state");
+                if (userService.isInitialAdminRequired()) {
+                    log.warning("No users exist. Run GhostPOS with --create-admin in an interactive terminal to create the first administrator.");
+                }
             }
         } catch (SQLException exception) {
             log.severe("Unable to initialize user accounts: " + exception.getMessage());
@@ -157,6 +175,7 @@ public class POS_System {
         int webPort = runtimeConfig.webPort();
 
         if (apiEnabled) {
+            log.debug("Startup: constructing register API server");
             apiServer = new ApiServer(
                     inventoryService,
                     salesService,
@@ -168,20 +187,28 @@ public class POS_System {
                     systemControl()
             );
             apiServer.start(apiHost, apiPort, allowedWebOrigins(webHost, webPort));
+        } else {
+            log.debug("Startup: register API is disabled by configuration");
         }
         if (webEnabled) {
             String apiBaseUrl = runtimeConfig.webApiBaseUrl().trim();
             if (apiBaseUrl.isEmpty()) {
                 apiBaseUrl = "http://" + browserHost(apiHost) + ":" + apiPort + "/api/v1";
             }
+            log.debug("Startup: constructing management web server");
             managementWebServer = new ManagementWebServer(apiBaseUrl, log);
             managementWebServer.start(webHost, webPort, apiPort);
+        } else {
+            log.debug("Startup: management web interface is disabled by configuration");
         }
+        log.debug("Startup: all configured services are running");
     }
 
     private static synchronized ApiServer.OperationResult reloadConfiguration() {
+        log.debug("Configuration reload: reading registered YAML files");
         RuntimeConfig previous = activeRuntimeConfig;
         configManager.reloadAll();
+        log.debug("Configuration reload: validating runtime settings");
         RuntimeConfig reloaded = readRuntimeConfig();
         applyRuntimeConfig(reloaded);
         activeRuntimeConfig = reloaded;
@@ -196,9 +223,11 @@ public class POS_System {
     }
 
     private static synchronized ApiServer.OperationResult reloadStorage() throws SQLException {
+        log.debug("Storage reload: reading and validating configuration");
         RuntimeConfig previous = activeRuntimeConfig;
         configManager.reloadAll();
         RuntimeConfig reloaded = readRuntimeConfig();
+        log.debug("Storage reload: initializing replacement " + reloaded.storageType() + " backend");
         storageManager.loadStorage(
                 reloaded.storageType(),
                 reloaded.mysqlHost(),
@@ -209,6 +238,7 @@ public class POS_System {
         );
         applyRuntimeConfig(reloaded);
         activeRuntimeConfig = reloaded;
+        log.debug("Storage reload: replacement backend is active");
         boolean restartRequired = previous != null && !previous.listenerSettingsMatch(reloaded);
         log.info("POS storage reloaded from configuration");
         return new ApiServer.OperationResult(
@@ -233,6 +263,9 @@ public class POS_System {
 
             @Override
             public void setDebugEnabled(boolean enabled) {
+                if (POS_System.DEBUG == enabled) {
+                    return;
+                }
                 POS_System.DEBUG = enabled;
                 log.info("Debug logging " + (enabled ? "enabled" : "disabled"));
             }
@@ -248,12 +281,14 @@ public class POS_System {
         log.warning("Backend shutdown requested by an administrator");
         Thread shutdownThread = new Thread(() -> {
             try {
+                log.debug("Shutdown: waiting briefly for the accepted response to flush");
                 Thread.sleep(1_000);
             } catch (InterruptedException exception) {
                 Thread.currentThread().interrupt();
                 log.severe("Delayed backend shutdown was interrupted");
                 return;
             }
+            log.debug("Shutdown: exiting process");
             System.exit(0);
         }, "pos-delayed-shutdown");
         shutdownThread.setDaemon(true);
@@ -261,6 +296,7 @@ public class POS_System {
     }
 
     private static RuntimeConfig readRuntimeConfig() {
+        log.debug("Configuration: parsing and validating runtime settings");
         boolean debug = config.getBoolean("debug", false);
         String storeName = config.getString("store-name", "Demo-Store").trim();
         if (storeName.isEmpty() || storeName.length() > 100) {
@@ -315,7 +351,7 @@ public class POS_System {
         if (sessionTtlMinutes < 5 || sessionTtlMinutes > 1_440) {
             throw new IllegalArgumentException("api.session-ttl-minutes must be between 5 and 1440");
         }
-        return new RuntimeConfig(
+        RuntimeConfig runtimeConfig = new RuntimeConfig(
                 debug,
                 storeName,
                 storageType,
@@ -334,6 +370,8 @@ public class POS_System {
                 webApiBaseUrl,
                 List.copyOf(webAllowedOrigins)
         );
+        log.debug("Configuration: runtime settings validated");
+        return runtimeConfig;
     }
 
     private static void applyRuntimeConfig(RuntimeConfig runtimeConfig) {

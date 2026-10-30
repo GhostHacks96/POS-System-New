@@ -28,6 +28,7 @@ public final class ManagementWebServer implements AutoCloseable {
         appJavaScript = readResource("/web/app.js");
         managementCss = readResource("/web/management.css");
         suppliedCss = readResource("/style.css");
+        logger.debug("Management web: loaded HTML, JavaScript, and stylesheet resources");
     }
 
     public synchronized void start(String host, int port, int apiPort) {
@@ -41,6 +42,7 @@ public final class ManagementWebServer implements AutoCloseable {
             throw new IllegalArgumentException("Management web port must be valid and separate from the API port");
         }
 
+        logger.debug("Management web: registering static routes and security headers");
         app = Javalin.create();
         app.before(ctx -> {
             ctx.header("X-Content-Type-Options", "nosniff");
@@ -60,6 +62,7 @@ public final class ManagementWebServer implements AutoCloseable {
                 ctx.contentType("text/css; charset=utf-8").result(managementCss));
         app.get("/style.css", ctx -> ctx.contentType("text/css; charset=utf-8").result(suppliedCss));
         app.get("/ui-config.json", ctx -> ctx.json(Map.of("apiBaseUrl", apiBaseUrl)));
+        logger.debug("Management web: routes registered; starting listener");
         try {
             app.start(host, port);
             logger.info("Management web interface listening on " + host + ":" + port);
@@ -75,6 +78,7 @@ public final class ManagementWebServer implements AutoCloseable {
     @Override
     public synchronized void close() {
         if (app != null) {
+            logger.debug("Management web: stopping listener");
             app.stop();
             app = null;
             logger.info("Management web interface stopped");

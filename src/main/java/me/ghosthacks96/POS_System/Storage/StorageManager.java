@@ -26,6 +26,8 @@ public final class StorageManager implements AutoCloseable {
             String database
     ) throws SQLException {
         Objects.requireNonNull(storageType, "storageType");
+        String normalizedStorageType = storageType.toLowerCase(Locale.ROOT);
+        logger.debug("Storage: preparing " + normalizedStorageType + " backend");
         PosStorage newStorage = switch (storageType.toLowerCase(Locale.ROOT)) {
             case "mysql" -> new MySQL_Interface(host, port, username, password, database, logger);
             case "sqlite", "sqlight" -> new SQLLight_Interface(storagePath.resolve("ghostpos.db"), logger);
@@ -35,8 +37,11 @@ public final class StorageManager implements AutoCloseable {
         };
 
         try {
+            logger.debug("Storage: initializing replacement backend");
             newStorage.initialize();
+            logger.debug("Storage: replacement backend initialized");
         } catch (SQLException exception) {
+            logger.debug("Storage: replacement initialization failed; retaining current backend");
             try {
                 newStorage.close();
             } catch (SQLException closeException) {
@@ -48,9 +53,10 @@ public final class StorageManager implements AutoCloseable {
         PosStorage previousStorage = storage;
         storage = newStorage;
         if (previousStorage != null) {
+            logger.debug("Storage: closing previous backend after successful replacement");
             previousStorage.close();
         }
-        logger.info("Initialized " + storageType + " POS storage");
+        logger.info("Initialized " + normalizedStorageType + " POS storage");
         return storage;
     }
 
@@ -64,8 +70,10 @@ public final class StorageManager implements AutoCloseable {
     @Override
     public synchronized void close() throws SQLException {
         if (storage != null) {
+            logger.debug("Storage: closing active backend");
             storage.close();
             storage = null;
+            logger.debug("Storage: active backend closed");
         }
     }
 }

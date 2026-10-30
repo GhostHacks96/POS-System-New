@@ -1,5 +1,6 @@
 package me.ghosthacks96.POS_System.Sales;
 
+import me.ghosthacks96.POS_System.POS_System;
 import me.ghosthacks96.POS_System.Storage.PosData.PaymentLine;
 import me.ghosthacks96.POS_System.Storage.PosData.Product;
 import me.ghosthacks96.POS_System.Storage.PosData.SaleDetails;
@@ -58,27 +59,38 @@ public final class SalesService {
             List<CartLine> cart,
             List<Tender> tenders
     ) throws SQLException {
+        POS_System.log.debug("Sales: starting checkout validation for cashier id="
+                + (actor == null ? "unknown" : actor.id()));
         UserPrincipal currentActor = requirePermission(actor, PROCESS_SALES);
         validateSaleNumber(saleNumber);
 
+        POS_System.log.debug("Sales: checking for a prior checkout with the same idempotency key");
         Optional<SaleDetails> existing = storage().getSaleByNumber(saleNumber);
         if (existing.isPresent()) {
+            POS_System.log.debug("Sales: prior checkout found; validating retry payload");
             return replayOrReject(
                     existing.get(), currentActor, saleNumber, customerId, requestedDiscount, cart, tenders
             );
         }
 
+        POS_System.log.debug("Sales: calculating totals and validating cart");
         SaleDraft draft = buildDraft(
                 currentActor, saleNumber, customerId, requestedDiscount, cart, tenders
         );
+        POS_System.log.debug("Sales: committing " + draft.lines().size() + " lines and "
+                + draft.payments().size() + " tenders");
         try {
             SaleReceipt receipt = storage().completeSale(draft);
+            POS_System.log.debug("Sales: transaction committed; loading persisted receipt");
             SaleDetails details = storage().getSaleByNumber(receipt.saleNumber())
                     .orElseThrow(() -> new SQLException("Completed sale could not be reloaded"));
+            POS_System.log.debug("Sales: checkout completed");
             return new CheckoutResult(details, cashChangeDue(details), false);
         } catch (SQLException exception) {
+            POS_System.log.debug("Sales: checkout returned a storage error; checking if concurrent retry committed");
             Optional<SaleDetails> committedByConcurrentRequest = storage().getSaleByNumber(saleNumber);
             if (committedByConcurrentRequest.isPresent()) {
+                POS_System.log.debug("Sales: found concurrently committed checkout; validating retry payload");
                 return replayOrReject(
                         committedByConcurrentRequest.get(),
                         currentActor,
@@ -94,6 +106,7 @@ public final class SalesService {
     }
 
     public SaleDetails getReceipt(UserPrincipal actor, String saleNumber) throws SQLException {
+        POS_System.log.debug("Sales: checking permission to retrieve receipt");
         UserPrincipal currentActor = Objects.requireNonNull(actor, "actor");
         boolean canViewAll = users.hasPermission(currentActor, VIEW_REPORTS);
         boolean canProcessSales = users.hasPermission(currentActor, PROCESS_SALES);
@@ -106,19 +119,25 @@ public final class SalesService {
         if (!canViewAll && details.userId() != currentActor.id()) {
             throw new SecurityException("Permission denied");
         }
+        POS_System.log.debug("Sales: receipt retrieved");
         return details;
     }
 
     public List<SaleSummary> listRecentSales(UserPrincipal actor, int limit) throws SQLException {
+        POS_System.log.debug("Sales: checking permission and loading recent sales");
         if (limit < 1 || limit > 500) {
             throw new IllegalArgumentException("Sale history limit must be between 1 and 500");
         }
         UserPrincipal currentActor = Objects.requireNonNull(actor, "actor");
         if (users.hasPermission(currentActor, VIEW_REPORTS)) {
-            return storage().listRecentSales(limit, null);
+            List<SaleSummary> results = storage().listRecentSales(limit, null);
+            POS_System.log.debug("Sales: returned " + results.size() + " sales to report viewer");
+            return results;
         }
         if (users.hasPermission(currentActor, PROCESS_SALES)) {
-            return storage().listRecentSales(limit, currentActor.id());
+            List<SaleSummary> results = storage().listRecentSales(limit, currentActor.id());
+            POS_System.log.debug("Sales: returned " + results.size() + " sales for cashier id=" + currentActor.id());
+            return results;
         }
         throw new SecurityException("Permission denied");
     }
@@ -175,6 +194,7 @@ public final class SalesService {
 
             Product product = storage().getProduct(item.productId())
                     .orElseThrow(() -> new IllegalArgumentException("Product does not exist"));
+            POS_System.log.debug("Sales: validated product id=" + product.id() + " and stock availability");
             if (!product.active()) {
                 throw new IllegalArgumentException("Product is inactive: " + product.sku());
             }
@@ -203,6 +223,7 @@ public final class SalesService {
             throw new SecurityException("Permission denied");
         }
         BigDecimal total = subtotal.subtract(discount);
+        POS_System.log.debug("Sales: cart total calculated");
         if (total.signum() == 0 && !tenders.isEmpty()) {
             throw new IllegalArgumentException("A zero-total sale must not include a payment");
         }
@@ -218,6 +239,7 @@ public final class SalesService {
                 throw new IllegalArgumentException("Tenders cannot be null");
             }
             TenderMethod method = TenderMethod.parse(tender.method());
+            POS_System.log.debug("Sales: validating tender method=" + method);
             BigDecimal amount = currency(tender.amount(), "Tender amount");
             if (amount.signum() <= 0) {
                 throw new IllegalArgumentException("Tender amounts must be greater than zero");
@@ -240,6 +262,7 @@ public final class SalesService {
         if (changeDue.compareTo(cashTotal) > 0) {
             throw new IllegalArgumentException("Change can only be given from cash tender");
         }
+        POS_System.log.debug("Sales: cart and tenders validated");
         return new SaleDraft(saleNumber, customerId, actor.id(), discount, ZERO, lines, payments);
     }
 
@@ -252,11 +275,13 @@ public final class SalesService {
             List<CartLine> cart,
             List<Tender> tenders
     ) throws SQLException {
+        POS_System.log.debug("Sales: verifying idempotent retry matches the original checkout");
         if (!sameSale(existing, actor, saleNumber, customerId, requestedDiscount, cart, tenders)) {
             throw new DuplicateSaleException(
                     "This idempotency key was already used for a different sale; retrieve its receipt before retrying"
             );
         }
+        POS_System.log.debug("Sales: retry matched original checkout; returning existing receipt");
         return new CheckoutResult(existing, cashChangeDue(existing), true);
     }
 

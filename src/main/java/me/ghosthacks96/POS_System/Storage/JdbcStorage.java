@@ -259,6 +259,7 @@ public abstract class JdbcStorage implements PosStorage {
 
     @Override
     public final void initialize() throws SQLException {
+        logger.debug("Database: opening connection to initialize POS schema");
         try (Connection connection = openConnection();
              Statement statement = connection.createStatement()) {
             for (String table : TABLES) {
@@ -267,6 +268,7 @@ public abstract class JdbcStorage implements PosStorage {
                         .replace("${LONG}", longType()));
             }
             statement.executeUpdate(bootstrapRowSql());
+            logger.debug("Database: initialized " + TABLES.length + " POS schema tables");
         } catch (SQLException exception) {
             logger.severe("Unable to initialize POS database schema: " + exception.getMessage());
             throw exception;
@@ -1118,6 +1120,8 @@ public abstract class JdbcStorage implements PosStorage {
 
     @Override
     public final SaleReceipt completeSale(SaleDraft sale) throws SQLException {
+        logger.debug("Database: validating sale transaction with "
+                + (sale == null || sale.lines() == null ? 0 : sale.lines().size()) + " lines");
         Objects.requireNonNull(sale, "sale");
         requireText(sale.saleNumber(), "saleNumber");
         Objects.requireNonNull(sale.lines(), "sale lines");
@@ -1183,6 +1187,7 @@ public abstract class JdbcStorage implements PosStorage {
                 (sale_number, customer_id, user_id, subtotal, discount_amount, tax_amount, total, status, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, 'COMPLETED', ?)
                 """;
+        logger.debug("Database: starting atomic sale and inventory transaction");
         try (Connection connection = openConnection()) {
             connection.setAutoCommit(false);
             try {
@@ -1258,6 +1263,7 @@ public abstract class JdbcStorage implements PosStorage {
                     }
                 }
                 connection.commit();
+                logger.debug("Database: committed sale, payment, and inventory records");
                 return new SaleReceipt(saleId, sale.saleNumber(), subtotal, discount, tax, total);
             } catch (SQLException | RuntimeException exception) {
                 rollback(connection, exception);

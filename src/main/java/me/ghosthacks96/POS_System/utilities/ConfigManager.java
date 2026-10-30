@@ -46,6 +46,7 @@ public final class ConfigManager {
     public synchronized <T extends AbstractConfig> T register(T config) {
         Objects.requireNonNull(config, "config");
         Path file = resolveFile(config.getFileName());
+        logger.debug("Config: registering " + config.getFileName());
         AbstractConfig existing = configs.get(file);
         if (existing != null) {
             if (existing == config) {
@@ -57,12 +58,15 @@ public final class ConfigManager {
         config.bind(this, file);
         try {
             if (Files.exists(file)) {
+                logger.debug("Config: reading existing file " + config.getFileName());
                 config.replaceValues(readValues(file));
             } else {
+                logger.debug("Config: creating defaults for " + config.getFileName());
                 config.loadDefaults();
                 writeValues(file, config.snapshotValues());
             }
             configs.put(file, config);
+            logger.debug("Config: registered " + config.getFileName());
             return config;
         } catch (RuntimeException exception) {
             config.unbind();
@@ -71,15 +75,18 @@ public final class ConfigManager {
     }
 
     public synchronized void saveAll() {
+        logger.debug("Config: saving " + configs.size() + " registered configuration files");
         for (AbstractConfig config : configs.values()) {
             save(config);
         }
     }
 
     public synchronized void reloadAll() {
+        logger.debug("Config: reloading " + configs.size() + " registered configuration files");
         for (AbstractConfig config : configs.values()) {
             reload(config);
         }
+        logger.debug("Config: all registered files reloaded");
     }
 
     public synchronized int getRegisteredCount() {
@@ -88,19 +95,24 @@ public final class ConfigManager {
 
     synchronized void save(AbstractConfig config) {
         requireRegistered(config);
+        logger.debug("Config: saving " + config.getFileName());
         writeValues(config.getFile(), config.snapshotValues());
+        logger.debug("Config: saved " + config.getFileName());
     }
 
     synchronized void reload(AbstractConfig config) {
         requireRegistered(config);
         Path file = config.getFile();
+        logger.debug("Config: reloading " + config.getFileName());
         if (!Files.exists(file)) {
             config.replaceValues(new LinkedHashMap<>());
             config.loadDefaults();
             writeValues(file, config.snapshotValues());
+            logger.debug("Config: recreated missing file " + config.getFileName());
             return;
         }
         config.replaceValues(readValues(file));
+        logger.debug("Config: reloaded " + config.getFileName());
     }
 
     private Map<String, Object> readValues(Path file) {

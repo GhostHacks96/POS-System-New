@@ -1,5 +1,6 @@
 package me.ghosthacks96.POS_System.Inventory;
 
+import me.ghosthacks96.POS_System.POS_System;
 import me.ghosthacks96.POS_System.Storage.PosStorage;
 
 import java.sql.SQLException;
@@ -27,6 +28,7 @@ public final class InventoryService {
     }
 
     public Product createProduct(Product product) throws SQLException {
+        POS_System.log.debug("Inventory: validating new product");
         Objects.requireNonNull(product, "product");
         if (product.id() > 0) {
             throw new IllegalArgumentException("New products must not already have an ID");
@@ -36,10 +38,14 @@ public final class InventoryService {
                     "Create products with zero stock, then use receiveStock to record initial inventory"
             );
         }
-        return storage().saveProduct(product);
+        Product created = storage().saveProduct(product);
+        POS_System.log.debug("Inventory: created product id=" + created.id());
+        return created;
     }
 
     public Product updateProduct(Product product) throws SQLException {
+        POS_System.log.debug("Inventory: loading product for metadata update id="
+                + (product == null ? "unknown" : product.id()));
         Objects.requireNonNull(product, "product");
         if (product.id() <= 0) {
             throw new IllegalArgumentException("Updated products must have a valid ID");
@@ -59,30 +65,45 @@ public final class InventoryService {
                 product.lowStockThreshold(),
                 product.active()
         );
-        return storage().updateProductDetails(metadataOnly);
+        Product updated = storage().updateProductDetails(metadataOnly);
+        POS_System.log.debug("Inventory: updated product metadata id=" + updated.id());
+        return updated;
     }
 
     public Optional<Product> findBySku(String sku) throws SQLException {
         requireText(sku, "SKU");
-        return storage().getProductBySku(sku);
+        POS_System.log.debug("Inventory: looking up product by SKU");
+        Optional<Product> result = storage().getProductBySku(sku);
+        POS_System.log.debug("Inventory: SKU lookup " + (result.isPresent() ? "matched" : "found no product"));
+        return result;
     }
 
     public Optional<Product> findByBarcode(String barcode) throws SQLException {
         requireText(barcode, "barcode");
-        return storage().getProductByBarcode(barcode);
+        POS_System.log.debug("Inventory: looking up product by barcode");
+        Optional<Product> result = storage().getProductByBarcode(barcode);
+        POS_System.log.debug("Inventory: barcode lookup " + (result.isPresent() ? "matched" : "found no product"));
+        return result;
     }
 
     public Optional<Product> getProduct(long productId) throws SQLException {
         requireProductId(productId);
+        POS_System.log.debug("Inventory: loading product id=" + productId);
         return storage().getProduct(productId);
     }
 
     public List<Product> listProducts(boolean activeOnly) throws SQLException {
-        return storage().listProducts(activeOnly);
+        POS_System.log.debug("Inventory: listing products (activeOnly=" + activeOnly + ")");
+        List<Product> products = storage().listProducts(activeOnly);
+        POS_System.log.debug("Inventory: returned " + products.size() + " products");
+        return products;
     }
 
     public List<Product> listLowStockProducts() throws SQLException {
-        return storage().listLowStockProducts();
+        POS_System.log.debug("Inventory: loading low-stock products");
+        List<Product> products = storage().listLowStockProducts();
+        POS_System.log.debug("Inventory: found " + products.size() + " low-stock products");
+        return products;
     }
 
     public InventoryTransaction receiveStock(
@@ -92,10 +113,15 @@ public final class InventoryService {
             String reason,
             String reference
     ) throws SQLException {
+        POS_System.log.debug("Inventory: receiving stock for product id=" + productId);
         requireProductId(productId);
         requirePositiveQuantity(quantity);
         requireText(reason, "stock receipt reason");
-        return storage().adjustInventory(productId, userId, quantity, "RESTOCK", reason, normalize(reference));
+        InventoryTransaction transaction = storage().adjustInventory(
+                productId, userId, quantity, "RESTOCK", reason, normalize(reference)
+        );
+        POS_System.log.debug("Inventory: stock receipt recorded transaction id=" + transaction.id());
+        return transaction;
     }
 
     public InventoryTransaction removeStock(
@@ -106,13 +132,16 @@ public final class InventoryService {
             String note,
             String reference
     ) throws SQLException {
+        POS_System.log.debug("Inventory: removing stock for product id=" + productId);
         requireProductId(productId);
         requirePositiveQuantity(quantity);
         Objects.requireNonNull(reason, "reason");
         requireText(note, "removal note");
-        return storage().adjustInventory(
+        InventoryTransaction transaction = storage().adjustInventory(
                 productId, userId, -quantity, reason.name(), note, normalize(reference)
         );
+        POS_System.log.debug("Inventory: stock removal recorded transaction id=" + transaction.id());
+        return transaction;
     }
 
     public InventoryTransaction adjustStock(
@@ -122,14 +151,17 @@ public final class InventoryService {
             String reason,
             String reference
     ) throws SQLException {
+        POS_System.log.debug("Inventory: adjusting stock for product id=" + productId);
         requireProductId(productId);
         if (quantityDelta == 0) {
             throw new IllegalArgumentException("Stock adjustment must change the quantity");
         }
         requireText(reason, "adjustment reason");
-        return storage().adjustInventory(
+        InventoryTransaction transaction = storage().adjustInventory(
                 productId, userId, quantityDelta, "ADJUSTMENT", reason, normalize(reference)
         );
+        POS_System.log.debug("Inventory: stock adjustment recorded transaction id=" + transaction.id());
+        return transaction;
     }
 
     public InventoryTransaction recordStockCount(
@@ -139,23 +171,34 @@ public final class InventoryService {
             String note,
             String reference
     ) throws SQLException {
+        POS_System.log.debug("Inventory: recording stock count for product id=" + productId);
         requireProductId(productId);
         if (countedQuantity < 0) {
             throw new IllegalArgumentException("Counted inventory cannot be negative");
         }
         requireText(note, "count note");
-        return storage().setInventoryCount(productId, userId, countedQuantity, note, normalize(reference));
+        InventoryTransaction transaction = storage().setInventoryCount(
+                productId, userId, countedQuantity, note, normalize(reference)
+        );
+        POS_System.log.debug("Inventory: stock count recorded transaction id=" + transaction.id());
+        return transaction;
     }
 
     public List<InventoryTransaction> getProductHistory(long productId, int limit) throws SQLException {
         requireProductId(productId);
         requirePositiveQuantity(limit);
-        return storage().getInventoryTransactions(productId, limit);
+        POS_System.log.debug("Inventory: loading transaction history for product id=" + productId);
+        List<InventoryTransaction> history = storage().getInventoryTransactions(productId, limit);
+        POS_System.log.debug("Inventory: returned " + history.size() + " transactions");
+        return history;
     }
 
     public List<InventoryTransaction> getRecentHistory(int limit) throws SQLException {
         requirePositiveQuantity(limit);
-        return storage().getRecentInventoryTransactions(limit);
+        POS_System.log.debug("Inventory: loading recent transaction history");
+        List<InventoryTransaction> history = storage().getRecentInventoryTransactions(limit);
+        POS_System.log.debug("Inventory: returned " + history.size() + " transactions");
+        return history;
     }
 
     private static void requireProductId(long productId) {

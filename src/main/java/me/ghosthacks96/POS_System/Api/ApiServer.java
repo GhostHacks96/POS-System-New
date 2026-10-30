@@ -41,6 +41,8 @@ public final class ApiServer implements AutoCloseable {
     private static final String API_PREFIX = "/api/v1";
     private static final String ACTOR_ATTRIBUTE = ApiServer.class.getName() + ".actor";
     private static final String STORAGE_LOCK_ATTRIBUTE = ApiServer.class.getName() + ".storageLock";
+    private static final String REQUEST_STARTED_ATTRIBUTE = ApiServer.class.getName() + ".requestStarted";
+    private static final String TRACE_REQUEST_ATTRIBUTE = ApiServer.class.getName() + ".traceRequest";
     private static final String RELOAD_CONFIG_PATH = API_PREFIX + "/system/reload-config";
     private static final String RELOAD_STORAGE_PATH = API_PREFIX + "/system/reload-storage";
     private static final SecureRandom RANDOM = new SecureRandom();
@@ -119,7 +121,9 @@ public final class ApiServer implements AutoCloseable {
                 rule.maxAge = 3_600;
             }));
         });
+        logger.debug("API: registering versioned routes and authentication handlers");
         configureRoutes(app);
+        logger.debug("API: route registration complete");
         try {
             app.start(host, port);
             logger.info("Register API listening on " + host + ":" + port);
@@ -138,6 +142,12 @@ public final class ApiServer implements AutoCloseable {
                 return;
             }
             String path = ctx.path();
+            boolean traceRequest = !(API_PREFIX + "/system/logs").equals(path);
+            if (traceRequest) {
+                ctx.attribute(TRACE_REQUEST_ATTRIBUTE, true);
+                ctx.attribute(REQUEST_STARTED_ATTRIBUTE, System.nanoTime());
+                logger.debug("API: request started " + ctx.method().name() + " " + safeRequestPath(path));
+            }
             if (isLifecyclePath(path, ctx.method().name())) {
                 return;
             }
@@ -154,7 +164,16 @@ public final class ApiServer implements AutoCloseable {
                 throw exception;
             }
         });
-        server.after(this::releaseStorageReadLock);
+        server.after(ctx -> {
+            releaseStorageReadLock(ctx);
+            Long startedAt = ctx.attribute(REQUEST_STARTED_ATTRIBUTE);
+            if (startedAt != null) {
+                long elapsedMillis = (System.nanoTime() - startedAt) / 1_000_000;
+                logger.debug("API: request finished " + ctx.method().name() + " "
+                        + safeRequestPath(ctx.path()) + " status=" + ctx.status()
+                        + " durationMs=" + elapsedMillis);
+            }
+        });
 
         server.exception(Exception.class, (exception, ctx) -> {
             releaseStorageReadLock(ctx);
@@ -363,20 +382,30 @@ public final class ApiServer implements AutoCloseable {
             requirePermission(ctx, Permission.MANAGE_SYSTEM_SETTINGS);
             ctx.json(new PublicSettings(
                     config.getString("store-name", "Demo-Store"),
+                    config.getString("store-address", ""),
+                    config.getString("store-phone", ""),
                     version
             ));
         });
         server.patch(API_PREFIX + "/settings", ctx -> {
             requirePermission(ctx, Permission.MANAGE_SYSTEM_SETTINGS);
             SettingsUpdateRequest request = ctx.bodyAsClass(SettingsUpdateRequest.class);
-            if (request.storeName() == null || request.storeName().isBlank()
+            if (request == null || request.storeName() == null || request.storeName().isBlank()
                     || request.storeName().trim().length() > 100) {
                 throw new IllegalArgumentException("Store name must be between 1 and 100 characters");
             }
+            String address = request.address() == null
+                    ? config.getString("store-address", "")
+                    : normalizeStoreField(request.address(), 500, "Store address");
+            String phone = request.phone() == null
+                    ? config.getString("store-phone", "")
+                    : normalizeStoreField(request.phone(), 40, "Store phone number");
             String storeName = request.storeName().trim();
             config.set("store-name", storeName);
+            config.set("store-address", address);
+            config.set("store-phone", phone);
             config.save();
-            ctx.json(new PublicSettings(storeName, version));
+            ctx.json(new PublicSettings(storeName, address, phone, version));
         });
         server.get(API_PREFIX + "/system/config", ctx -> {
             requirePermission(ctx, Permission.ADMINISTER_SYSTEM);
@@ -390,6 +419,10 @@ public final class ApiServer implements AutoCloseable {
             DebugModeRequest request = ctx.bodyAsClass(DebugModeRequest.class);
             if (request == null || request.enabled() == null) {
                 throw new IllegalArgumentException("Debug mode state is required");
+            }
+            if (config.getBoolean("debug", false) == request.enabled()) {
+                ctx.json(new DebugModeResponse(request.enabled()));
+                return;
             }
             config.set("debug", request.enabled());
             config.save();
@@ -430,6 +463,10 @@ public final class ApiServer implements AutoCloseable {
     }
 
     private void authenticateRequest(io.javalin.http.Context ctx) throws SQLException {
+        boolean traceRequest = Boolean.TRUE.equals(ctx.attribute(TRACE_REQUEST_ATTRIBUTE));
+        if (traceRequest) {
+            logger.debug("API auth: validating bearer session");
+        }
         String token = bearerToken(ctx);
         String digest = tokenDigest(token);
         Session session = sessions.get(digest);
@@ -448,6 +485,9 @@ public final class ApiServer implements AutoCloseable {
             throw new AuthenticationException("Authentication required");
         }
         ctx.attribute(ACTOR_ATTRIBUTE, principal);
+        if (traceRequest) {
+            logger.debug("API auth: request authenticated for account id=" + principal.id());
+        }
     }
 
     private void releaseStorageReadLock(io.javalin.http.Context ctx) {
@@ -482,6 +522,8 @@ public final class ApiServer implements AutoCloseable {
     private ReceiptResponse toReceiptResponse(SaleDetails details, BigDecimal cashChangeDue) {
         return new ReceiptResponse(
                 config.getString("store-name", "Demo-Store"),
+                config.getString("store-address", ""),
+                config.getString("store-phone", ""),
                 version,
                 details.receipt(),
                 details.createdAt(),
@@ -538,6 +580,7 @@ public final class ApiServer implements AutoCloseable {
     }
 
     private void handleException(Exception exception, io.javalin.http.Context ctx) {
+        logger.debug("API: request processing stopped (" + exception.getClass().getSimpleName() + ")");
         if (exception instanceof AuthenticationException) {
             ctx.status(401).header("WWW-Authenticate", "Bearer")
                     .json(new ApiError("unauthorized", exception.getMessage()));
@@ -584,6 +627,11 @@ public final class ApiServer implements AutoCloseable {
 
     private static boolean isLoopbackHost(String host) {
         return "localhost".equalsIgnoreCase(host) || "127.0.0.1".equals(host) || "::1".equals(host);
+    }
+
+    private static String safeRequestPath(String path) {
+        return path.replaceAll("/\\d+(?=/|$)", "/{id}")
+                .replaceAll("/sales/[^/]+/receipt", "/sales/{saleNumber}/receipt");
     }
 
     private static long parseId(String value, String name) {
@@ -636,6 +684,14 @@ public final class ApiServer implements AutoCloseable {
         } catch (NumberFormatException exception) {
             throw new IllegalArgumentException("Log cursor must be a non-negative integer");
         }
+    }
+
+    private static String normalizeStoreField(String value, int maxLength, String fieldName) {
+        String normalized = value.trim();
+        if (normalized.length() > maxLength) {
+            throw new IllegalArgumentException(fieldName + " cannot exceed " + maxLength + " characters");
+        }
+        return normalized;
     }
 
     private static Map<String, Object> sanitizedConfig(Map<String, Object> values) {
@@ -772,6 +828,8 @@ public final class ApiServer implements AutoCloseable {
 
     private record ReceiptResponse(
             String storeName,
+            String storeAddress,
+            String storePhone,
             String systemVersion,
             me.ghosthacks96.POS_System.Storage.PosData.SaleReceipt sale,
             Instant issuedAt,
@@ -831,7 +889,7 @@ public final class ApiServer implements AutoCloseable {
     private record PasswordResetRequest(String newPassword) {
     }
 
-    private record SettingsUpdateRequest(String storeName) {
+    private record SettingsUpdateRequest(String storeName, String address, String phone) {
     }
 
     private record DebugModeRequest(Boolean enabled) {
@@ -846,7 +904,7 @@ public final class ApiServer implements AutoCloseable {
     private record LogEntriesResponse(List<Logger.LogEntry> entries) {
     }
 
-    private record PublicSettings(String storeName, String version) {
+    private record PublicSettings(String storeName, String address, String phone, String version) {
     }
 
     private record MessageResponse(String message) {
